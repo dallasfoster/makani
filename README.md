@@ -179,20 +179,20 @@ By default, Makani will save out a model package when training starts. Model pac
 The folder `data_process` contains a collection of scripts in order to modify data input files or compute statistics on them.
 
 #### Core Data Processing
-`annotate_dataset.py` - Adds metadata annotations to HDF5 files including timestamps, latitude/longitude coordinates, and channel names. Ensures uniform time information across datasets by converting to UTC timezone.
-`concatenate_dataset.py` - Creates virtual HDF5 datasets by combining multiple year files into a single dataset without physical copying, reducing disk overhead.
-`h5_convert.py` - Reformats HDF5 files to enable compression and chunking. Supports various compression modes (LZF, GZIP, SZIP, scale-offset) and chunking strategies for optimized storage and access.
+* `annotate_dataset.py` - Adds metadata annotations to HDF5 files including timestamps, latitude/longitude coordinates, and channel names. Ensures uniform time information across datasets by converting to UTC timezone.
+* `concatenate_dataset.py` - Creates virtual HDF5 datasets by combining multiple year files into a single dataset without physical copying, reducing disk overhead.
+* `h5_convert.py` - Reformats HDF5 files to enable compression and chunking. Supports various compression modes (LZF, GZIP, SZIP, scale-offset) and chunking strategies for optimized storage and access.
 Statistics and Analysis
-`get_stats.py` - Computes comprehensive statistics from datasets including global means, standard deviations, min/max values, time means, and time-difference statistics. Supports MPI for distributed processing.
-`get_histograms.py` - Generates histograms from dataset distributions, useful for data analysis and validation. Also supports MPI for distributed processing.
-`postprocess_stats.py` - Post-processes computed statistics by correcting water channel minima to exactly 0.0 and clamping standard deviations to prevent numerical issues.
+* `get_stats.py` - Computes comprehensive statistics from datasets including global means, standard deviations, min/max values, time means, and time-difference statistics. Supports MPI for distributed processing.
+* `get_histograms.py` - Generates histograms from dataset distributions, useful for data analysis and validation. Also supports MPI for distributed processing.
+* `postprocess_stats.py` - Post-processes computed statistics by correcting water channel minima to exactly 0.0 and clamping standard deviations to prevent numerical issues.
 
 #### WeatherBench2 Integration
-`generate_wb2_climatology.py` - Generates WeatherBench2-compatible climatology data and ground profile masks from ERA5 data (1990-2019 averages). Creates HDF5 datasets with user-specified channel selection and ordering.
-`convert_wb2_to_makani_input.py` - Converts ARCO-ERA5 data (WeatherBench2 format) to Makani-compatible HDF5 format. Handles channel name translation and data restructuring.
-`convert_makani_output_to_wb2.py` - Converts Makani inference outputs to WeatherBench2 format for evaluation and comparison with other models.
-`merge_wb2_dataset.py` - Transfers specific channels between Makani HDF5 files. This can be used for channels which are present in Copernicus ERA5 but not on ARCO-ERA5 (such as 10m wind speeds).
-`wb2_helpers.py` - Utility functions for WeatherBench2 integration, including channel name translation between Makani and WeatherBench2 conventions for both surface and atmospheric variables.
+* `generate_wb2_climatology.py` - Generates WeatherBench2-compatible climatology data and ground profile masks from ERA5 data (1990-2019 averages). Creates HDF5 datasets with user-specified channel selection and ordering.
+* `convert_wb2_to_makani_input.py` - Converts ARCO-ERA5 data (WeatherBench2 format) to Makani-compatible HDF5 format. Handles channel name translation and data restructuring.
+* `convert_makani_output_to_wb2.py` - Converts Makani inference outputs to WeatherBench2 format for evaluation and comparison with other models.
+* `merge_wb2_dataset.py` - Transfers specific channels between Makani HDF5 files. This can be used for channels which are present in Copernicus ERA5 but not on ARCO-ERA5 (such as 10m wind speeds).
+* `wb2_helpers.py` - Utility functions for WeatherBench2 integration, including channel name translation between Makani and WeatherBench2 conventions for both surface and atmospheric variables.
 
 This collection of scripts provides a complete pipeline for data preprocessing, statistical analysis, and WeatherBench2 compatibility for weather forecasting models.
 
