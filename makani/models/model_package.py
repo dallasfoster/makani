@@ -61,21 +61,21 @@ class LocalPackage:
     @staticmethod
     def _load_static_data(root, params):
         if params.get("add_orography", False):
-            params.orography_path = os.path.join(root, OROGRAPHY_FILE)
+            params.orography_path = os.path.join(root, self.OROGRAPHY_FILE)
         if params.get("add_landmask", False):
-            params.landmask_path = os.path.join(root, LANDMASK_FILE)
+            params.landmask_path = os.path.join(root, self.LANDMASK_FILE)
         if params.get("add_soiltype", False):
-            params.soiltype_path = os.path.join(root, SOILTYPE_FILE)
+            params.soiltype_path = os.path.join(root, self.SOILTYPE_FILE)
 
         # alweays load all normalization files
         if params.get("global_means_path", None) is not None:
-            params.global_means_path = os.path.join(root, MEANS_FILE)
+            params.global_means_path = os.path.join(root, self.MEANS_FILE)
         if params.get("global_stds_path", None) is not None:
-            params.global_stds_path = os.path.join(root, STDS_FILE)
+            params.global_stds_path = os.path.join(root, self.STDS_FILE)
         if params.get("min_path", None) is not None:
-            params.min_path = os.path.join(root, MINS_FILE)
+            params.min_path = os.path.join(root, self.MINS_FILE)
         if params.get("max_path", None) is not None:
-            params.max_path = os.path.join(root, MAXS_FILE)
+            params.max_path = os.path.join(root, self.MAXS_FILE)
 
 
 class ModelWrapper(torch.nn.Module):
