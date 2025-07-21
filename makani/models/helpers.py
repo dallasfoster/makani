@@ -20,25 +20,50 @@ from makani.utils import comm
 
 
 def count_parameters(model, device):
+    """Counts model parameters"""
+
     with torch.no_grad():
-        total_count = 0
+        total_stats = torch.zeros(2, dtype=torch.long, device=device)
+        local_bytes = 0
         for p in model.parameters():
             if not p.requires_grad:
                 continue
-            # reduce over model group
-            pcount = torch.tensor(p.numel(), device=device)
-            if hasattr(p, "is_shared_mp") and p.is_shared_mp:
-                if comm.get_size("model") > 1:
-                    dist.all_reduce(pcount, group=comm.get_group("model"))
-                # divide by shared dims:
-                for cname in p.is_shared_mp:
-                    pcount = pcount / comm.get_size(cname)
-            total_count += int(pcount.item())
 
-    return total_count
+            # make sure complex weight tensors are accounted for correctly
+            pview = torch.view_as_real(p) if p.is_complex() else p
+            pstats = torch.tensor([pview.numel(), pview.nbytes], dtype=torch.long, device=device)
+            local_bytes += pview.nbytes
+
+            # if the weight is split, then we need to reduce
+            if hasattr(p, "sharded_dims_mp"):
+                for group in p.sharded_dims_mp:
+                    if (group is not None) and (comm.get_size(group) > 1):
+                        dist.all_reduce(pstats, group=comm.get_group(group))
+
+            # sum the total stats
+            total_stats += pstats
+
+    # transfer to cpu
+    total_stats_arr = total_stats.cpu().numpy()
+    total_count = total_stats_arr[0]
+    total_bytes = total_stats_arr[1]
+
+    return total_count, total_bytes, local_bytes
+
+
+def compare_model_parameters(model1, model2):
+    """Checks whether both models have the same parameters"""
+
+    for p1, p2 in zip(model1.parameters(), model2.parameters()):
+        if p1.data.ne(p2.data).any():
+            return False
+    return True
 
 
 def check_parameters(model):
+    """Prints shapes, strides and whether parameters are contiguous"""
     for p in model.parameters():
         if p.requires_grad:
             print(p.shape, p.stride(), p.is_contiguous())
+
+    return

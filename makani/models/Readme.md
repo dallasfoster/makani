@@ -38,7 +38,7 @@ The model registry is a central place for organizing models in makani. By defaul
 ```python
 from makani.models import model_registry
 
-model = model_registry.get_model(params)
+model = model_registry.get_model(params, multistep=False)
 ```
 
 where `params` is the parameters object used to instantiate the model. Custom models can be registered in the registry using the `register` method. Models are required to take keyword arguments. These are automatically parsed from the `params` datastructure and passed to the model.

@@ -1,20 +1,20 @@
 # Makani: Massively parallel training of machine-learning based weather and climate models
 
-[**Overview**](#overview) | [**Getting started**](#getting-started) | [**More information**](#more-about-makani) | [**Known issues**](#known-issues) | [**Contributing**](#contributing) | [**Further reading**](#further-reading) | [**References**](#references)
+[**Overview**](#overview) | [**Getting started**](#getting-started) | [**More information**](#more-about-makani) | [**Contributing**](#contributing) | [**Further reading**](#further-reading) | [**References**](#references)
 
 [![tests](https://github.com/NVIDIA/makani/actions/workflows/tests.yml/badge.svg)](https://github.com/NVIDIA/makani/actions/workflows/tests.yml)
 
-Makani (the Hawaiian word for wind 🍃🌺) is an experimental library designed to enable the research and development of machine-learning based weather and climate models in PyTorch. Makani is used for ongoing research. Stable features are regularly ported to the [NVIDIA PhysicsNeMo](https://developer.nvidia.com/physicsnemo) framework, a framework used for training Physics-ML models in Science and Engineering.
+Makani (the Hawaiian word for wind 🍃🌺) is a library designed to enable the research and development of the next generation of machine-learning (ML) based weather and climate models in PyTorch. Makani was used to train [FourCastNet3 [1]](https://arxiv.org/abs/2507.12144v2), [Spherical Fourier Neural Operators (SFNO) [2]](https://arxiv.org/abs/2306.03838) for weather (FourCastNet2), [Huge ensemble of SFNO (HENS-SFNO) [3,4]](https://arxiv.org/abs/2408.03100), and [FourCastNet1 [5]](https://arxiv.org/abs/2202.11214).
+
+Makani is aimed at researchers working on ML based weather prediction. Stable features are frequently ported to the [earth2studio](https://github.com/NVIDIA/earth2studio) and the [NVIDIA PhysicsNeMo](https://developer.nvidia.com/physicsnemo) framework. For commercial and production purposes, we recommend checking out these packages.
 
 <div align="center">
-<img src="https://github.com/NVIDIA/makani/blob/main/images/sfno_rollout.gif"  height="388px">
+<img src="https://github.com/NVIDIA/makani/blob/main/images/fcn3_ens3_640p"  height="388px">
 </div>
 
 ## Overview
 
-Makani was started by engineers and researchers at NVIDIA and NERSC to train [FourCastNet](https://github.com/NVlabs/FourCastNet), a deep-learning based weather prediction model.
-
-Makani is a research code built for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Among others, Makani was used to train [Spherical Fourier Neural Operators (SFNO)](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) [1] and [Adaptive Fourier Neural Operators (AFNO)](https://arxiv.org/abs/2111.13587) [2] on the ERA5 dataset. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, unpredicted channels, autoregressive training and much more.
+Makani is a research code developed by engineers and researchers at NVIDIA and NERSC for massively parallel training of weather and climate prediction models on 100+ GPUs and to enable the development of the next generation of weather and climate models. Makani is written in [PyTorch](https://pytorch.org) and supports various forms of model- and data-parallelism, asynchronous loading of data, unpredicted channels, autoregressive training and much more. Makani is fully configurable through .yaml configuration files and support flexible development of novel models. Metrics, Losses and other components are designed in a modular fashion to support configurable, custom training- and inference-recipes at scale. Makani also supports scalable, fully online scoring modes, which are compatible with WeatherBench2. Among others, Makani was used to train the [FourCastNet](https://research.nvidia.com/publication/2025-07_fourcastnet-3-geometric-approach-probabilistic-machine-learning-weather) models, on the ERA5 dataset.
 
 ## Getting started
 
@@ -28,43 +28,55 @@ pip install -e .
 
 ### Training:
 
-Training is launched by calling `train.py` and passing it the necessary CLI arguments to specify the configuration file `--yaml_config` and he configuration target `--config`:
+Makani supports ensemble and deterministic training. Ensemble training is launched by calling `ensemble.py`, whereas deterministic training is launched by calling `train.py`. Both scripts expect the CLI arguments to specify the configuration file `--yaml_config` and he configuration target `--config`, which is contained in the configuration file:
 
 ```bash
-mpirun -np 8 --allow-run-as-root python -u makani.train --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2"
+mpirun -np 8 --allow-run-as-root python -u train.py --yaml_config="config/fourcastnet3.yaml" --config="fcn3_sc2_edim45_layers10_pretrain1"
 ```
-
-:warning: **architectures with complex-valued weights** will currently fail. See  [Known issues](#known-issues) for more information.
 
 Makani supports various optimization to fit large models ino GPU memory and enable computationally efficient training. An overview of these features and corresponding CLI arguments is provided in the following table:
 
 | Feature                   | CLI argument                                  | options                      |
 |---------------------------|-----------------------------------------------|------------------------------|
+| Batch size                | `--batch_size`                                | 1,2,3,...                    |
+| Ensemble size             | `--ensemble_size`                             | 1,2,3,...                    |
 | Automatic Mixed Precision | `--amp_mode`                                  | `none`, `fp16`, `bf16`       |
 | Just-in-time compilation  | `--jit_mode`                                  | `none`, `script`, `inductor` |
-| CUDA graphs               | `--cuda_graph_mode`                           | `none`, `fwdbwd`, `step`     |
 | Activation checkpointing  | `--checkpointing_level`                       | 0,1,2,3                      |
-| Data parallelism          | `--batch_size`                                | 1,2,3,...                    |
 | Channel parallelism       | `--fin_parallel_size`, `--fout_parallel_size` | 1,2,3,...                    |
 | Spatial model parallelism | `--h_parallel_size`, `--w_parallel_size`      | 1,2,3,...                    |
+| Ensemble parallelism      | `--ensemble_parallel_size`                    | 1,2,3,...                    |
 | Multistep training        | `--multistep_count`                           | 1,2,3,...                    |
+| Skip training             | `--skip_training`                             |                              |
+| Skip validation           | `--skip_validation`                           |                              |
 
 Especially larger models are enabled by using a mix of these techniques. Spatial model parallelism splits both the model and the data onto multiple GPUs, thus reducing both the memory footprint of the model and the load on the IO as each rank only needs to read a fraction of the data. A typical "large" training run of SFNO can be launched by running
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u makani.train --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u makani.train --amp_mode=bf16 --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
 ```
 Here we train the model on 256 GPUs, split horizontally across 4 ranks with a batch size of 64, which amounts to a local batch size of 1/4. Memory requirements are further reduced by the use of `bf16` automatic mixed precision.
 
 ### Inference:
 
-In a similar fashion to training, inference can be called from the CLI by calling `inference.py` and handled by `inferencer.py`. To launch inference on the out-of-sample dataset, we can call:
+Makani supports scalable and flexible on-line inference aimed at minimizing data movement and disk I/O, which is well suited to the low inference costs of ML weather models and modern HPC infrastructure. In a similar fashion to training, inference can be called from the CLI by calling `inference.py` and handled by `inferencer.py`. To launch inference on the out-of-sample dataset, we can call:
 
 ```bash
-mpirun -np 256 --allow-run-as-root python -u makani.inference --amp_mode=bf16 --cuda_graph_mode=fwdbwd --multistep_count=1 --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --h_parallel_size=4 --w_parallel_size=1 --batch_size=64
+mpirun -np 256 --allow-run-as-root python -u makani.inference --run_num="ngpu256_sp4" --yaml_config="config/sfnonet.yaml" --config="sfno_linear_73chq_sc3_layers8_edim384_asgl2" --batch_size=64
 ```
 
-By default, the inference script will perform inference on the out-of-sample dataset specified 
+By default, the inference script will perform inference on the out-of-sample dataset and compute the mtrics. The inference script supports model, data and ensemble parallelism out of the box, enabling efficient and scalable scoring. The inference script support additional CLI arguments which enable validation on a subset of the dataset, as well as writing out inferred states:
+
+| Feature                   | CLI argument                                  | options                      |
+|---------------------------|-----------------------------------------------|------------------------------|
+| Start date                | `--start_date`                                | 2018-01-01+UTC00:00:00       |
+| End date                  | `--end_date`                                  | 2018-12-31+UTC24:00:00       |
+| Date step (in hours)      | `--date_step`                                 | 1,2,...                      |
+| Output file               | `--output_file`                               | file path for field outputs  |
+| Output channels           | `--output_channels`                           | channels to write out        |
+| Metrics file              | `--metrics_file`                              | file path for metrics output |
+| Bias file                 | `--bias_file`                                 | file path for bias output    |
+| Spectrum file             | `--spectrum_file`                             | file path for spectra output |
 
 ## More about Makani
 
@@ -102,15 +114,17 @@ makani
 ```
 
 ### Model and Training configuration
-Model training in Makani is specified through the use of `.yaml` files located in the `config` folder. The corresponding models are located in `networks` and registered in the `get_model` routine in `networks/models.py`. The following table lists the most important configuration options.
+Model training in Makani is specified through the use of `.yaml` files located in the `config` folder. The corresponding models are located in `modelf` and registered in the model registry in `models/model_registry.py`. The following table lists the most important configuration options.
 
 | Configuration Key         | Description                                             | Options                                                 |
 |---------------------------|---------------------------------------------------------|---------------------------------------------------------|
-| `nettype`                 | Network architecture.                                   | `SFNO`, `FNO`, `AFNO`, `ViT`                            |
-| `loss`                    | Loss function.                                          | `l2`, `geometric l2`, ...                               |
-| `optimizer`               | Optimizer to be used.                                   | `Adam`, `AdamW`                                         |
+| `nettype`                 | Network architecture.                                   | `FCN3`,`SFNO`, `SNO`, `AFNO`, `ViT`                     |
+| `loss`                    | Loss function.                                          | `l2`, `geometric l2`, `amse`, `crps`...                 |
+| `channel_weights`         | Weighting function for the respective channels.         | `constant`, `auto`, `uncertainty`...                    |
+| `optimizer`               | Optimizer to be used.                                   | `Adam`, `AdamW`, `SGD`,`Sirfshampoo`                    |
 | `lr`                      | Initial learning rate.                                  | float > 0.0                                             |
 | `batch_size`              | Batch size.                                             | integer > 0                                             |
+| `ensemble_size`           | Ensemble size.                                          | integer > 0                                             |
 | `max_epochs`              | Number of epochs to train for                           | integer                                                 |
 | `scheduler`               | Learning rate scheduler to be used.                     | `None`, `CosineAnnealing`, `ReduceLROnPlateau`, `StepLR`|
 | `lr_warmup_steps`         | Number of warmup steps for the learning rate scheduler. | integer >= 0                                            |
@@ -150,13 +164,15 @@ Makani requires a metadata file named `data.json`, which describes important pro
 
 The ERA5 dataset can be downloaded [here](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels?tab=overview).
 
+### Checkpoints and restarting
+
+Makani supports 2 checkpointing formats `legacy` and `flexible`. By default, makani uses the `legacy` format, which saves the model, optimizer and scheduler state dicts into a file for each model parallel rank. This enables restoring the run in the same model-parallel configuration, including optimizer and scheduler states. Alternatively, if a different model-parallel configuration needs to be chosen, the `flexible` format can be used to restore the model in another configuration. Unfortunately, support for restoring optimizer states in this manner is still experimental. Which format is used for saving and restoring is determined by the
+
+Makani offers a conversion script to convert `legacy` checkpoints into `flexible` checkpoints. It can be run by calling `python -u makani.convert_checkpoint` script.
+
 ### Model packages
 
 By default, Makani will save out a model package when training starts. Model packages allow easily contain all the necessary data to run the model. This includes statistics used to normalize inputs and outputs, unpredicted static channels and even the code which appends celestial features such as the cosine of the solar zenith angle. Read more about model packages [here](networks/Readme.md).
-
-## Known Issues
-
-:warning: **architectures with complex-valued weights**: Training some architectures with complex-valued weights requires yet to be released patches to PyTorch. A hotfix that addresses these issues is available in the `makani/third_party/torch` folder. Overwriting the corresponding files in the PyTorch installation will resolve these issues.
 
 ## Contributing
 
@@ -169,30 +185,53 @@ While this is a research project, we aim to have functional unit tests with dece
 
 ## Further reading
 
-- [Modulus](https://developer.nvidia.com/modulus), NVIDIA's library for physics-ML
+- [FourCastNet 3 paper](https://arxiv.org/abs/2507.12144v2)
+- [NVIDIA Research FCN3 site](https://research.nvidia.com/publication/2025-07_fourcastnet-3-geometric-approach-probabilistic-machine-learning-weather) on FourCastNet 3
 - [NVIDIA blog article](https://developer.nvidia.com/blog/modeling-earths-atmosphere-with-spherical-fourier-neural-operators/) on Spherical Fourier Neural Operators for ML-based weather prediction
 - [torch-harmonics](https://github.com/NVIDIA/torch-harmonics), a library for differentiable Spherical Harmonics in PyTorch
-- [ECMWF ERA5 dataset](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-single-levels)
-- [SFNO-based forecasts deployed by ECMWF](https://charts.ecmwf.int/products/fourcast_medium-mslp-wind850)
-- [Apex](https://github.com/NVIDIA/apex), tools for easier mixed precision
+- [earth2studio](https://github.com/NVIDIA/earth2studio), a library for intercomparing DL based weather models
+- [PhysicsNeMo](https://developer.nvidia.com/physicsnemo), NVIDIA's library for physics-ML
 - [Dali](https://developer.nvidia.com/dali), NVIDIA data loading library
-- [earth2mip](https://github.com/NVIDIA/earth2mip), a library for intercomparing DL based weather models
 
 ## Authors
 
-<img src="https://www.nvidia.com/content/dam/en-zz/Solutions/about-nvidia/logo-and-brand/01-nvidia-logo-horiz-500x200-2c50-d@2x.png"  height="120px"><img src="https://www.nersc.gov/assets/Logos/NERSClogocolor.png"  height="120px">
+<table>
+  <tr>
+    <td align="center" valign="middle">
+      <img src="https://upload.wikimedia.org/wikipedia/commons/a/a4/NVIDIA_logo.svg" width="300px">
+    </td>
+    <td align="center" valign="middle">
+      <img src="https://www.nersc.gov/_resources/themes/nersc/images/NERSC_logo_no_spacing.svg" height="100px">
+    </td>
+  </tr>
+</table>
 
-The code was developed by Thorsten Kurth, Boris Bonev, Jean Kossaifi, Animashree Anandkumar, Kamyar Azizzadenesheli, Noah Brenowitz, Ashesh Chattopadhyay, Yair Cohen, David Hall, Peter Harrington, Pedram Hassanzadeh, Christian Hundt, Alexey Kamenev, Karthik Kashinath, Zongyi Li, Morteza Mardani, Jaideep Pathak, Mike Pritchard, David Pruitt, Sanjeev Raja, Shashank Subramanian.
+The code was developed by Thorsten Kurth, Boris Bonev, Ankur Mahesh, Dallas Foster, Jean Kossaifi, Animashree Anandkumar, Kamyar Azizzadenesheli, Noah Brenowitz, Ashesh Chattopadhyay, Yair Cohen, William D. Collins, Franziska Gerken, David Hall, Peter Harrington, Pedram Hassanzadeh, Christian Hundt, Karthik Kashinath, Zongyi Li, Morteza Mardani, Jaideep Pathak, Stefanos Pertigkiozoglou, Mike Pritchard, David Pruitt, Sanjeev Raja, Shashank Subramanian.
 
 
 ## References
 
-<a id="#sfno_paper">[1]</a> 
+<a id="#fcn3_paper">[1]</a>
+Bonev B., Kurth T., Mahesh A., Bisson, M., Kossaifi J., Kashinath K., Anandkumar A. Collins W.D., Pritchard M., Keller A.;
+FourCastNet 3: A geometric approach to probabilistic machine-learning weather forecasting at scale;
+arXiv 2507.12144, 2025.
+
+<a id="#sfno_paper">[2]</a>
 Bonev B., Kurth T., Hundt C., Pathak, J., Baust M., Kashinath K., Anandkumar A.;
 Spherical Fourier Neural Operators: Learning Stable Dynamics on the Sphere;
 arXiv 2306.0383, 2023.
 
-<a id="1">[2]</a> 
+<a id="#hens1_paper">[3]</a>
+Mahesh A., Collins W.D., Bonev B., Brenowitz N., Cohen Y., Elms J., Harrington P., Kashinath K., Kurth T., North J., OBrian T., Pritchard M., Pruitt D., Risser M., Subramanian S., Willard J.
+Huge Ensembles Part I: Design of Ensemble Weather Forecasts using Spherical Fourier Neural Operators;
+arXiv 2408.03100, 2025.
+
+<a id="#hens1_paper">[4]</a>
+Mahesh A., Collins W.D., Bonev B., Brenowitz N., Cohen Y., Elms J., Harrington P., Kashinath K., Kurth T., North J., OBrian T., Pritchard M., Pruitt D., Risser M., Subramanian S., Willard J.
+Huge Ensembles Part II: Properties of a Huge Ensemble of Hindcasts Generated with Spherical Fourier Neural Operators;
+arXiv 2408.01581, 2025.
+
+<a id="1">[5]</a>
 Pathak J., Subramanian S., Harrington P., Raja S., Chattopadhyay A., Mardani M., Kurth T., Hall D., Li Z., Azizzadenesheli K., Hassanzadeh P., Kashinath K., Anandkumar A.;
 FourCastNet: A Global Data-driven High-resolution Weather Model using Adaptive Fourier Neural Operators;
 arXiv 2202.11214, 2022.
@@ -202,22 +241,13 @@ arXiv 2202.11214, 2022.
 If you use this package, please cite
 
 ```bibtex
-@InProceedings{bonev2023sfno,
-    title={Spherical {F}ourier Neural Operators: Learning Stable Dynamics on the Sphere},
-    author={Bonev, Boris and Kurth, Thorsten and Hundt, Christian and Pathak, Jaideep and Baust, Maximilian and Kashinath, Karthik and Anandkumar, Anima},
-    booktitle={Proceedings of the 40th International Conference on Machine Learning},
-    pages={2806--2823},
-    year={2023},
-    volume={202},
-    series={Proceedings of Machine Learning Research},
-    month={23--29 Jul},
-    publisher={PMLR},
-}
-
-@article{pathak2022fourcastnet,
-    title={Fourcastnet: A global data-driven high-resolution weather model using adaptive fourier neural operators},
-    author={Pathak, Jaideep and Subramanian, Shashank and Harrington, Peter and Raja, Sanjeev and Chattopadhyay, Ashesh and Mardani, Morteza and Kurth, Thorsten and Hall, David and Li, Zongyi and Azizzadenesheli, Kamyar and Hassanzadeh, Pedram and Kashinath, Karthik and Anandkumar, Animashree},
-    journal={arXiv preprint arXiv:2202.11214},
-    year={2022}
+@misc{bonev2025fourcastnet3,
+      title={FourCastNet 3: A geometric approach to probabilistic machine-learning weather forecasting at scale},
+      author={Boris Bonev and Thorsten Kurth and Ankur Mahesh and Mauro Bisson and Jean Kossaifi and Karthik Kashinath and Anima Anandkumar and William D. Collins and Michael S. Pritchard and Alexander Keller},
+      year={2025},
+      eprint={2507.12144},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2507.12144},
 }
 ```

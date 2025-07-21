@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# This file contains code from the climt project (https://github.com/CliMT/climt)
+# which is licensed under BSD-3-Clause. The original copyright notice is preserved below.
+
 """
 climt/LICENSE
 @mcgibbon
@@ -29,8 +35,7 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
 # code taken from climt repo https://github.com/CliMT/climt
 # modified 2024: vectorization over coordinates and JIT compilation added
 
-import datetime
-import pytz
+import datetime as dt
 import numpy as np
 from typing import Union, Tuple, TypeVar
 
@@ -46,7 +51,7 @@ dtype = np.float32
 def _days_from_2000(model_time: np.ndarray) -> np.ndarray:
     """Get the days since year 2000."""
     # compute total days
-    time_diff = model_time - datetime.datetime(2000, 1, 1, 12, 0, tzinfo=pytz.utc)
+    time_diff = model_time - dt.datetime(2000, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
     result = np.asarray(time_diff).astype("timedelta64[us]") / np.timedelta64(1, "D")
     result = result.astype(dtype)
 
@@ -234,9 +239,13 @@ if __name__ == "__main__":
     lon_grid, lat_grid = np.meshgrid(lon, lat)
 
     # model time
-    model_time = np.asarray([datetime.datetime(2002, 1, 1, 12, 0, 0, tzinfo=pytz.utc),
-                             datetime.datetime(2002, 6, 1, 12, 0, 0, tzinfo=pytz.utc),
-                             datetime.datetime(2003, 1, 1, 12, 0, 0, tzinfo=pytz.utc)])
+    model_time = np.asarray(
+        [
+            dt.datetime(2002, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2002, 6, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            dt.datetime(2003, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+        ]
+    )
 
     # test _days_from_2000
     days = _days_from_2000(model_time)

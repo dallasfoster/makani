@@ -28,17 +28,17 @@ from typing import Optional
 import math
 
 # helpers
-from makani.models.common import ComplexReLU, PatchEmbed, DropPath, MLP
+from makani.models.common import ComplexReLU, PatchEmbed2D, DropPath, MLP
 
 
-@torch.jit.script
+@torch.compile
 def compl_mul_add_fwd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     tmp = torch.einsum("bkixys,kior->srbkoxy", a, b)
     res = torch.stack([tmp[0, 0, ...] - tmp[1, 1, ...], tmp[1, 0, ...] + tmp[0, 1, ...]], dim=-1)
     return res
 
 
-@torch.jit.script
+@torch.compile
 def compl_mul_add_fwd_c(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     ac = torch.view_as_complex(a)
     bc = torch.view_as_complex(b)
@@ -129,7 +129,7 @@ class Block(nn.Module):
         use_complex_kernels=True,
         skip_fno="linear",
         nested_skip_fno=True,
-        checkpointing=False,
+        checkpointing_level=0,
         verbose=True,
     ):
         super(Block, self).__init__()
@@ -167,7 +167,7 @@ class Block(nn.Module):
         self.norm2 = norm_layer()  # ((h,w))
 
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop_rate=drop, checkpointing=checkpointing)
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop_rate=drop, checkpointing=(checkpointing_level>=2))
 
     def forward(self, x):
         residual = x
@@ -191,7 +191,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
     def __init__(
         self,
         inp_shape=(720, 1440),
-        patch_size=(16, 16),
+        patch_size=(6, 6),
         inp_chans=2,
         out_chans=2,
         embed_dim=768,
@@ -205,7 +205,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
         skip_fno="linear",
         nested_skip_fno=True,
         hard_thresholding_fraction=1.0,
-        checkpointing=False,
+        checkpointing_level=0,
         use_complex_kernels=True,
         verbose=False,
         **kwargs,
@@ -223,7 +223,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
             self.img_size[1] % self.patch_size[1] == 0
         ), f"Error, the patch size {self.patch_size} does not divide the image dimensions {self.img_size} evenly."
 
-        self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=self.patch_size, in_chans=self.inp_chans, embed_dim=self.embed_dim)
+        self.patch_embed = PatchEmbed2D(img_size=self.img_size, patch_size=self.patch_size, in_chans=self.inp_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, num_patches))
@@ -259,7 +259,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
                     use_complex_kernels=use_complex_kernels,
                     skip_fno=skip_fno,
                     nested_skip_fno=nested_skip_fno,
-                    checkpointing=checkpointing,
+                    checkpointing_level=checkpointing_level,
                     verbose=verbose,
                 )
                 for i in range(num_layers)
@@ -283,7 +283,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=False)
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 

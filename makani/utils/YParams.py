@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from ruamel.yaml import YAML
 import json
 
 
 class ParamsBase:
-    """Convenience wrapper around a dictionary
+    """
+    Convenience wrapper around a dictionary
 
     Allows referring to dictionary items as attributes, and tracking which
     attributes are modified.
@@ -49,6 +51,20 @@ class ParamsBase:
         new_attrs = {key: val for key, val in vars(self).items() if key not in self._original_attrs}
         return {**self.params, **new_attrs}
 
+    def is_set(self, attribute: str):
+        return hasattr(self, attribute) and (getattr(self, attribute) is not None)
+
+    def to_yaml(self, path, overwrite=False):
+        if os.path.isfile(path):
+            if not overwrite:
+                raise FileExistsError(f"Error, file {path} already exists.")
+            else:
+                os.remove(path)
+
+        yaml = YAML()
+        with open(path, "w") as f:
+            yaml.dump(self.to_dict(), f)
+
     @staticmethod
     def from_json(path: str) -> "ParamsBase":
         with open(path) as f:
@@ -66,16 +82,21 @@ class ParamsBase:
 
 
 class YParams(ParamsBase):
-    def __init__(self, yaml_filename, config_name, print_params=False):
+    def __init__(self, yaml_filename, config_name=None, print_params=False):
         """Open parameters stored with ``config_name`` in the yaml file ``yaml_filename``"""
         super().__init__()
         self._yaml_filename = yaml_filename
-        self._config_name = config_name
+        if config_name is not None:
+            self._config_name = config_name
         if print_params:
             print("------------------ Configuration ------------------")
 
         with open(yaml_filename) as _file:
-            d = YAML().load(_file)[config_name]
+            token = YAML().load(_file)
+            if config_name is not None:
+                d = token[config_name]
+            else:
+                d = token
 
         self.update_params(d)
 
@@ -87,7 +108,8 @@ class YParams(ParamsBase):
     def log(self, logger):
         logger.info("------------------ Configuration ------------------")
         logger.info("Configuration file: " + str(self._yaml_filename))
-        logger.info("Configuration name: " + str(self._config_name))
+        if hasattr(self, "_config_name"):
+            logger.info("Configuration name: " + str(self._config_name))
         for key, val in self.to_dict().items():
             logger.info(str(key) + " " + str(val))
         logger.info("---------------------------------------------------")

@@ -98,3 +98,16 @@ class ComplexActivation(nn.Module):
             out = z
 
         return out
+
+
+# inspired from https://developer.nvidia.com/blog/rethinking-how-to-train-diffusion-models/
+class MagnitudePreservingSiLU(nn.Module):
+    def __init__(self, normalization_factor=0.596):
+        super().__init__()
+
+        # store normalization factor
+        self.norminv = 1.0 / normalization_factor
+        self.silu = torch.nn.SiLU(inplace=False)
+
+    def forward(self, x):
+        return self.norminv * self.silu(x)

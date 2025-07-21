@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import torch.fft
 from makani.utils.img_utils import PeriodicPad2d
 
-from makani.models.common import DropPath, PatchEmbed
+from makani.models.common import DropPath, PatchEmbed2D
 
 
 class Mlp(nn.Module):
@@ -175,7 +175,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
     def __init__(
         self,
         inp_shape=(720, 1440),
-        patch_size=(16, 16),
+        patch_size=(6, 6),
         inp_chans=2,
         out_chans=2,
         embed_dim=768,
@@ -197,7 +197,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
 
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=self.patch_size, in_chans=self.inp_chans, embed_dim=self.embed_dim)
+        self.patch_embed = PatchEmbed2D(img_size=self.img_size, patch_size=self.patch_size, in_chans=self.inp_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dim))
@@ -239,7 +239,7 @@ class AdaptiveFourierNeuralOperatorNet(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=True)
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 

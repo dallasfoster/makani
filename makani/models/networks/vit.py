@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 
 import torch.nn.functional as F
@@ -7,7 +22,7 @@ from functools import partial
 
 # mp stuff
 from makani.utils import comm
-from makani.models.common import DropPath, MLP, PatchEmbed
+from makani.models.common import DropPath, MLP, PatchEmbed2D
 from makani.mpu.layers import DistributedMatmul, DistributedMLP, DistributedAttention
 
 
@@ -123,8 +138,8 @@ class Block(nn.Module):
 class VisionTransformer(nn.Module):
     def __init__(
         self,
-        inp_shape=[224, 224],
-        patch_size=(16, 16),
+        inp_shape=[72, 144],
+        patch_size=(6, 6),
         inp_chans=3,
         out_chans=3,
         embed_dim=768,
@@ -148,7 +163,7 @@ class VisionTransformer(nn.Module):
         self.comm_inp_name = comm_inp_name
         self.comm_hidden_name = comm_hidden_name
 
-        self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=patch_size, in_chans=inp_chans, embed_dim=self.embed_dim)
+        self.patch_embed = PatchEmbed2D(img_size=self.img_size, patch_size=patch_size, in_chans=inp_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
 
         # annotate for distributed

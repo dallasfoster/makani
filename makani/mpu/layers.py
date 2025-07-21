@@ -13,164 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.cuda.amp import custom_fwd, custom_bwd
+from torch.amp import custom_fwd, custom_bwd
 
 from makani.utils import comm
 
 # parallel helpers
-from modulus.distributed.utils import compute_split_shapes
-from modulus.distributed.mappings import reduce_from_parallel_region
-from modulus.distributed.mappings import scatter_to_parallel_region
-from modulus.distributed.mappings import gather_from_parallel_region
-from modulus.distributed.mappings import copy_to_parallel_region
+from physicsnemo.distributed.utils import compute_split_shapes
+from physicsnemo.distributed.mappings import reduce_from_parallel_region
+from physicsnemo.distributed.mappings import scatter_to_parallel_region
+from physicsnemo.distributed.mappings import gather_from_parallel_region
+from physicsnemo.distributed.mappings import copy_to_parallel_region
 
 # use some distributed routines from torch harmonics
 from torch_harmonics.distributed import distributed_transpose_azimuth as distributed_transpose_w
 from torch_harmonics.distributed import distributed_transpose_polar as distributed_transpose_h
 
 
-class DistributedRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):
-        super(DistributedRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = min(lmax or self.nlat, self.nlat)
-        self.mmax = min(mmax or self.nlon // 2 + 1, self.nlon // 2 + 1)
-
-        # compute half modes
-        self.lmax_high = math.ceil(self.lmax / 2)
-        self.lmax_low = math.floor(self.lmax / 2)
-
-        # shapes
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_h)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_w)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_h)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_w)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # store number of chans
-        num_chans = x.shape[1]
-        
-        # h and w is split. First we make w local by transposing into channel dim
-        if self.comm_size_w > 1:
-            x = distributed_transpose_w.apply(x, (1, -1), self.lon_shapes)
-
-        # do first FFT
-        x = torch.fft.rfft(x, n=self.nlon, dim=-1, norm="ortho")
-
-        # mode truncation
-        x = x[..., :self.mmax].contiguous()
-        
-        # transpose: after this, m is split and c is local
-        if self.comm_size_w > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_w)
-            x = distributed_transpose_w.apply(x, (-1, 1), chan_shapes)
-            
-        # transpose: after this, c is split and h is local
-        if self.comm_size_h > 1:
-            x = distributed_transpose_h.apply(x, (1, -2), self.lat_shapes)
-
-        # do second FFT:
-        x = torch.fft.fft(x, n=self.nlat, dim=-2, norm="ortho")
-
-        # apply mode truncation:
-        x = torch.cat([x[..., :self.lmax_high,  :],
-                       x[..., -self.lmax_low:, :]], dim=-2)
-        
-        # transpose: after this, l is split and c is local
-        if self.comm_size_h > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_h)
-            x = distributed_transpose_h.apply(x, (-2, 1), chan_shapes)
-
-        return x
-
-
-class DistributedInverseRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):
-        super(DistributedInverseRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = min(lmax or self.nlat, self.nlat)
-        self.mmax = min(mmax or self.nlon // 2 + 1, self.nlon // 2 + 1)
-
-        # compute half modes
-        self.lmax_high = math.ceil(self.lmax / 2)
-        self.lmax_low = math.floor(self.lmax / 2)
-
-        # shapes
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_h)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_w)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_h)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_w)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # store number of channels
-        num_chans = x.shape[1]
-
-        # transpose: after that, channels are split, l is local:
-        if self.comm_size_h > 1:
-            x = distributed_transpose_h.apply(x, (1, -2), self.l_shapes)
-            
-        # we should pad the middle here manually, so that the inverse FFT is correct
-        # TEST THIS
-        if self.lmax < self.nlat:
-            xh = x[..., :self.lmax_high, :]
-            xl = x[..., -self.lmax_low:, :]
-            xhp = F.pad(xh, (0, 0, 0, self.nlat-self.lmax), mode="constant")
-            x = torch.cat([xhp, xl], dim=-2)
-
-        # do first fft
-        x = torch.fft.ifft(x, n=self.nlat, dim=-2, norm="ortho")
-
-        if self.comm_size_h > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_h)
-            x = distributed_transpose_h.apply(x, (-2, 1), chan_shapes)
-
-        # transpose: after this, channels are split and m is local
-        if self.comm_size_w > 1:
-            x = distributed_transpose_w.apply(x, (1, -1), self.m_shapes)
-
-        # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nlon, dim=-1, norm="ortho")
-
-        # transpose: after this, m is split and channels are local
-        if self.comm_size_w > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_w)
-            x = distributed_transpose_w.apply(x, (-1, 1), chan_shapes)
-
-        return x
-
-
 class _DistMatmulHelper(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, X, weight, bias, inp_group_name, out_group_name):
         # store some variables
         ctx.save_for_backward(X, weight, bias)
@@ -192,7 +59,7 @@ class _DistMatmulHelper(torch.autograd.Function):
         return xconvbias
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
         X, weight, bias = ctx.saved_tensors
         gname = ctx.out_group_name
@@ -336,7 +203,7 @@ class DistributedMLP(nn.Module):
         checkpointing=False,
         gain=1.0,
     ):
-        super(DistributedMLP, self).__init__()
+        super().__init__()
         self.checkpointing = checkpointing
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -389,7 +256,7 @@ class DistributedMLP(nn.Module):
 
         return x
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=False)
     def _checkpoint_forward(self, x):
         return checkpoint(self.fwd, x, use_reentrant=False)
 
@@ -402,7 +269,7 @@ class DistributedMLP(nn.Module):
 
 class DistributedPatchEmbed(nn.Module):
     def __init__(self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768, input_is_matmul_parallel=False, output_is_matmul_parallel=True):
-        super(DistributedPatchEmbed, self).__init__()
+        super().__init__()
 
         # store params
         self.input_parallel = input_is_matmul_parallel
@@ -466,7 +333,7 @@ class DistributedAttention(nn.Module):
         proj_drop_rate=0.0,
         norm_layer=nn.LayerNorm,
     ):
-        super(DistributedAttention, self).__init__()
+        super().__init__()
 
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
         self.num_heads = num_heads
@@ -523,14 +390,14 @@ class DistributedAttention(nn.Module):
         return x
 
 
-@torch.jit.script
+@torch.compile
 def compl_mul_add_fwd(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     tmp = torch.einsum("bkixys,kiot->stbkoxy", a, b)
     res = torch.stack([tmp[0, 0, ...] - tmp[1, 1, ...], tmp[1, 0, ...] + tmp[0, 1, ...]], dim=-1) + c
     return res
 
 
-@torch.jit.script
+@torch.compile
 def compl_mul_add_fwd_c(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     ac = torch.view_as_complex(a)
     bc = torch.view_as_complex(b)
@@ -552,7 +419,7 @@ class DistributedAFNO2Dv2(nn.Module):
         output_is_matmul_parallel=False,
         use_complex_kernels=False,
     ):
-        super(DistributedAFNO2Dv2, self).__init__()
+        super().__init__()
         assert hidden_size % num_blocks == 0, f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
 
         # get comm sizes:

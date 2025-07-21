@@ -13,15 +13,193 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+from functools import partial
+
+import h5py as h5
+
 import torch
 import wandb
 
 # distributed computing stuff
 from makani.utils import comm
-from makani.utils.metrics.functions import GeometricL1, GeometricRMSE, GeometricACC, Quadrature
+
+# loss stuff
+from makani.utils.dataloaders.data_helpers import get_data_normalization
+from makani.utils.losses import LossType
+from makani.utils.metrics.functions import GeometricL1, GeometricRMSE, GeometricACC, GeometricSpread, GeometricSSR, GeometricCRPS, GeometricRankHistogram, Quadrature
 import torch.distributed as dist
-from modulus.distributed.utils import compute_split_shapes
-from modulus.distributed.mappings import gather_from_parallel_region
+from physicsnemo.distributed.utils import compute_split_shapes, split_tensor_along_dim
+from physicsnemo.distributed.mappings import gather_from_parallel_region, reduce_from_parallel_region
+
+
+class MetricRollout:
+    def __init__(self, metric_name, metric_channels, metric_handle, channel_names, num_rollout_steps, dtphys, device, aux_shape=None, aux_shape_finalized=None, scale=None, integrate=False, report_metric=True):
+
+        # store members
+        self.metric_name = metric_name
+        self.metric_channels = metric_channels
+        self.device = device
+        self.integrate = integrate
+        self.report_metric = report_metric
+        self.num_rollout_steps = num_rollout_steps
+        self.dtphys = dtphys
+        # setting this allows the rollout handler to
+        # work with metrics which do have additional dimensions.
+        # it will be inserted after the channels dim
+        self.aux_shape = aux_shape
+        self.aux_shape_finalized = aux_shape_finalized
+
+        # instantiate handle
+        self.metric_func = metric_handle().to(self.device)
+        self.metric_type = self.metric_func.type
+        #self.metric_func = torch.compile(self.metric_func, mode="max-autotune-no-cudagraphs")
+
+        # get mapping from channels to all channels
+        self.channel_mask = [channel_names.index(c) for c in metric_channels]
+
+        # deal with scale
+        if scale is not None:
+            self.scale = scale[self.channel_mask].to(self.device)
+
+        # create arrays:
+        self.num_channels = len(self.metric_channels)
+        if self.aux_shape is None:
+            data_shape = (self.num_rollout_steps, self.num_channels)
+        else:
+            data_shape = (self.num_rollout_steps, self.num_channels, *self.aux_shape)
+        self.rollout_curve = torch.zeros(data_shape, dtype=torch.float32, device=self.device)
+        self.rollout_counter = torch.zeros((self.num_rollout_steps), dtype=torch.float32, device=self.device)
+
+        # CPU buffers
+        pin_memory = self.device.type == "cuda"
+        
+        if self.aux_shape_finalized is None:
+            data_shape_finalized  = (self.num_rollout_steps, self.num_channels)
+            integral_shape = (self.num_channels)
+        else:
+            data_shape_finalized = (self.num_rollout_steps, self.num_channels, *self.aux_shape_finalized)
+            integral_shape = (self.num_channels, *self.aux_shape_finalized)
+        
+        self.rollout_curve_cpu = torch.zeros(data_shape_finalized, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
+
+        if self.integrate:
+            self.rollout_integral = torch.zeros(integral_shape, dtype=torch.float32, device=self.device)
+            self.rollout_integral_cpu = torch.zeros(integral_shape, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
+            self.simpquad = Quadrature(self.num_rollout_steps - 1, 1.0 / float(self.num_rollout_steps), self.device)
+
+    @property
+    def type(self):
+        return self.metric_type
+
+    def zero_buffers(self):
+        """set buffers to zero"""
+        with torch.no_grad():
+            self.rollout_curve.fill_(0.0)
+            self.rollout_counter.fill_(0.0)
+            if self.integrate:
+                self.rollout_integral.fill_(0.0)
+        return
+
+    def update(self, inp: torch.Tensor, tar: torch.Tensor, idt: int, wgt: Optional[torch.Tensor] = None):
+
+        # check dimension
+        inpp = inp[..., self.channel_mask, :, :]
+        tarp = tar[..., self.channel_mask, :, :]
+
+        # compute metric
+        metric = self.metric_func(inpp, tarp, wgt)
+
+        if hasattr(self, "scale"):
+            metric = metric * self.scale
+
+        vals = torch.stack([self.rollout_curve[idt, ...], metric], dim=0)
+        counts = torch.stack([self.rollout_counter[idt], torch.tensor(inp.shape[0], device=self.rollout_counter.device, dtype=self.rollout_counter.dtype)], dim=0)
+        vals, counts = self.metric_func.combine(vals, counts, dim=0)
+        self.rollout_curve[idt, ...].copy_(vals)
+        self.rollout_counter[idt].copy_(counts)
+
+        return
+
+    def _combine_helper(self, vallist, countlist):
+        vals = torch.stack(vallist, dim=0).contiguous()
+        counts = torch.stack(countlist, dim=0).contiguous()
+        for idt in range(self.num_rollout_steps):
+            vtmp, ctmp = self.metric_func.combine(vals[:, idt, ...], counts[:, idt], dim=0)
+            self.rollout_curve[idt, ...].copy_(vtmp)
+            self.rollout_counter[idt].copy_(ctmp)
+
+    def reduce(self, non_blocking=False):
+        # sum here
+        with torch.no_grad():
+            if dist.is_initialized():
+                # gather results
+                # values
+                vallist = [torch.empty_like(self.rollout_curve) for _ in range(comm.get_size("batch"))]
+                vallist[comm.get_rank("batch")] = self.rollout_curve
+                valreq = dist.all_gather(vallist, self.rollout_curve, group=comm.get_group("batch"), async_op=non_blocking)
+                # counter
+                countlist = [torch.empty_like(self.rollout_counter) for _ in range(comm.get_size("batch"))]
+                countlist[comm.get_rank("batch")] = self.rollout_counter
+                countreq = dist.all_gather(countlist, self.rollout_counter, group=comm.get_group("batch"), async_op=non_blocking)
+                if valreq is not None:
+                    valreq.wait()
+                if countreq is not None:
+                    countreq.wait()
+
+                # combine
+                self._combine_helper(vallist, countlist)
+        return
+
+    def finalize(self, non_blocking=False):
+        """Finalize routine to gather the metrics to rank 0 and assemble logs"""
+
+        # sum here
+        with torch.no_grad():
+            # normalize, this depends on the internal logic on the metric function and whether we kept
+            # track of the mean or the sum and counts
+            cshape = [1 for _ in range(self.rollout_curve.dim())]
+            cshape[0] = -1
+            counts = self.rollout_counter.reshape(cshape)
+            rollout_curve_normalized = self.metric_func.finalize(self.rollout_curve, counts)
+
+            # copy to host
+            self.rollout_curve_cpu.copy_(rollout_curve_normalized, non_blocking=non_blocking)
+
+            # integrate
+            if self.integrate:
+                self.rollout_integral.copy_(self.simpquad(rollout_curve_normalized, dim=0))
+                self.rollout_integral_cpu.copy_(self.rollout_integral, non_blocking=non_blocking)
+
+        return
+
+    def report(self, index=0, table=False):
+        log = {}
+
+        if self.report_metric:
+            rollout_curve_arr = self.rollout_curve_cpu.numpy()
+            for idx, var_name in enumerate(self.metric_channels):
+                log[f"{self.metric_name} {var_name}({(index+1) * self.dtphys})"] = rollout_curve_arr[index, idx]
+
+            if self.integrate:
+                rollout_integral_arr = self.rollout_integral_cpu.numpy()
+                for idx, var_name in enumerate(self.metric_channels):
+                    log[f"{self.metric_name} AUC {var_name}({self.num_rollout_steps * self.dtphys})"] = rollout_integral_arr[idx]
+
+        report = log
+
+        if table:
+            if self.report_metric:
+                table_data = []
+                for d in range(0, self.num_rollout_steps):
+                    for idx, var_name in enumerate(self.metric_channels):
+                        table_data.append([self.metric_name, var_name, (d + 1) * self.dtphys, rollout_curve_arr[d, idx]])
+
+                report = (log, table_data)
+            else:
+                report = (log, [])
+
+        return report
 
 
 class MetricsHandler:
@@ -32,21 +210,30 @@ class MetricsHandler:
     def __init__(
         self,
         params,
-        mult,
-        clim,
+        climatology,
+        num_rollout_steps,
         device,
-        rmse_var_names=["u10m", "t2m", "u500", "z500", "r500", "q500"],
-        acc_vars_names=["u10m", "t2m", "u500", "z500", "r500", "q500"],
-        acc_auc_var_names=["u10m", "t2m", "u500", "z500", "r500", "q500"],
+        l1_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        rmse_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        acc_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        crps_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        spread_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        ssr_var_names=["u10m", "t2m", "u500", "z500", "q500", "sp"],
+        rh_var_names=[],
+        wb2_compatible=False,
     ):
+
         self.device = device
         self.log_to_screen = params.log_to_screen
         self.log_to_wandb = params.log_to_wandb
+        # these are the names of the channels emitted by the dataloader in that order
         self.channel_names = params.channel_names
+        self.spatial_distributed = comm.is_distributed("spatial") and (comm.get_size("spatial") > 1)
+        self.ensemble_distributed = comm.is_distributed("ensemble") and (comm.get_size("ensemble") > 1)
 
         # set a stream
         if self.device.type == "cuda":
-            self.stream = torch.cuda.Stream()
+            self.stream = torch.Stream(device='cuda')
         else:
             self.stream = None
 
@@ -55,155 +242,339 @@ class MetricsHandler:
         self.dd = 24 // self.dtxdh
 
         # select the vars which are actually present
-        rmse_var_names = [x for x in rmse_var_names if x in self.channel_names]
-        acc_vars_names = [x for x in acc_vars_names if x in self.channel_names]
-        acc_auc_var_names = [x for x in acc_auc_var_names if x in self.channel_names]
+        self.l1_var_names = [x for x in l1_var_names if x in self.channel_names]
+        self.rmse_var_names = [x for x in rmse_var_names if x in self.channel_names]
+        self.acc_var_names = [x for x in acc_var_names if x in self.channel_names]
+        self.crps_var_names = [x for x in crps_var_names if x in self.channel_names]
+        self.spread_var_names = [x for x in spread_var_names if x in self.channel_names]
+        self.ssr_var_names = [x for x in ssr_var_names if x in self.channel_names]
+        self.rh_var_names = [x for x in rh_var_names if x in self.channel_names]
 
-        # now create an inverse mapping
-        rmse_vars = {var_name: self.channel_names.index(var_name) for var_name in rmse_var_names}
-        acc_vars = {var_name: self.channel_names.index(var_name) for var_name in acc_vars_names}
-        acc_auc_vars = {var_name: self.channel_names.index(var_name) for var_name in acc_auc_var_names}
-
-        self.rmse_vars = rmse_vars
-        self.acc_vars = acc_vars
-        self.acc_auc_vars = acc_auc_vars
-
+        # split channels not supported atm
         self.split_data_channels = params.split_data_channels
+        if self.split_data_channels:
+            raise NotImplementedError(f"Error, split_data_channels is not supported")
 
-        # get some stats: make data shared with tensor from the class
-        self.mult = mult.to(self.device)
+        # load normalization term:
+        bias, scale = get_data_normalization(params)
+        if bias is not None:
+            bias = torch.from_numpy(bias).to(torch.float32)
+            # filter by used channels
+            bias = bias[:, params.out_channels, ...].contiguous()
+        else:
+            bias = torch.zeros((1, params.N_out_channels, 1, 1), dtype=torch.float32)
+
+        if scale is not None:
+            scale = torch.from_numpy(scale).to(torch.float32)
+            # filter by used channels: this is done inside the metrics rollout handler
+            scale = scale[:, params.out_channels, ...].contiguous()
+        else:
+            scale = torch.ones((1, params.N_out_channels, 1, 1), dtype=torch.float32)
 
         # how many steps to run in acc curve
-        self.valid_autoreg_steps = params.valid_autoreg_steps
-
-        # climatology for autoregressive ACC
-        self.simpquad = Quadrature(self.valid_autoreg_steps, 1.0 / float(self.valid_autoreg_steps + 1), self.device)
-        clim = torch.unsqueeze(clim, 0)
-        self.clim = clim.to(self.device, dtype=torch.float32)
-        matmul_comm_size = comm.get_size("matmul")
-
-        # get global and local output channels
-        self.N_out_channels = params.N_out_channels
-        if self.split_data_channels:
-            self.out_channels_local = (params.N_out_channels + matmul_comm_size - 1) // matmul_comm_size
-            # split channel-wise climatology by matmul parallel rank
-            mprank = comm.get_rank("matmul")
-            self.clim = torch.split(self.clim, self.out_channels_local, dim=1)[mprank].contiguous()
-        else:
-            self.out_channels_local = params.N_out_channels
+        self.num_rollout_steps = num_rollout_steps
 
         # store shapes
         self.img_shape = (params.img_shape_x, params.img_shape_y)
         self.crop_shape = (params.img_crop_shape_x, params.img_crop_shape_y)
         self.crop_offset = (params.img_crop_offset_x, params.img_crop_offset_y)
 
-        # grid renaming
-        quadrature_rule_type = "naive"
-        if params.model_grid_type == "legendre_gauss":
-            quadrature_rule_type = "legendre-gauss"
+        # grid extraction
+        grid_type = params.get("model_grid_type", "equiangular")
+
+        # enable overwriting this with weatherbench2 compatible metrics
+        if wb2_compatible:
+            if grid_type == "equiangular":
+                grid_type = "weatherbench2"
+            else:
+                raise ValueError(f"weatherbench2 compatibility only supported on equiangular grids. Got {grid_type} instead")
 
         # set up handles
-        self.l1_handle = GeometricL1(
-            quadrature_rule_type,
-            img_shape=self.img_shape,
-            crop_shape=self.crop_shape,
-            crop_offset=self.crop_offset,
-            normalize=True,
-            channel_reduction="mean",
-            batch_reduction="sum",
-        ).to(self.device)
-        self.l1_handle = torch.compile(self.l1_handle, mode="max-autotune-no-cudagraphs")
+        self.metric_handles = []
 
-        self.rmse_handle = GeometricRMSE(
-            quadrature_rule_type,
-            img_shape=self.img_shape,
-            crop_shape=self.crop_shape,
-            crop_offset=self.crop_offset,
-            normalize=True,
-            channel_reduction="none",
-            batch_reduction="none",
-        ).to(self.device)
-        self.rmse_handle = torch.compile(self.rmse_handle, mode="max-autotune-no-cudagraphs")
+        # L1
+        if self.l1_var_names:
+            handle = partial(
+                GeometricL1,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+                batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+            )
 
-        self.acc_handle = GeometricACC(
-            quadrature_rule_type,
-            img_shape=self.img_shape,
-            crop_shape=self.crop_shape,
-            crop_offset=self.crop_offset,
-            normalize=True,
-            channel_reduction="none",
-            batch_reduction="sum",
-        ).to(self.device)
-        self.acc_handle = torch.compile(self.acc_handle, mode="max-autotune-no-cudagraphs")
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="L1",
+                    metric_channels=self.l1_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    integrate=False,
+                    report_metric=True,
+                )
+            )
 
-        self.do_gather_input = False
+        if self.rmse_var_names:
+            handle = partial(
+                GeometricRMSE,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+                batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+            )
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="RMSE",
+                    metric_channels=self.rmse_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    scale=scale.reshape(-1),
+                    integrate=False,
+                    report_metric=True,
+                )
+            )
+            self.rmse_curve = self.metric_handles[-1].rollout_curve
+
+        if self.acc_var_names:
+            # if we use dynamic climatology, then we have to set it to None here:
+            # important: we assume that the climatology is normalized with bias and scale!
+            if climatology is not None:
+                channel_mask = [self.channel_names.index(c) for c in self.acc_var_names]
+                clim = climatology.to(torch.float32)
+                # project channels
+                clim = clim[:, channel_mask, ...].contiguous().to(self.device)
+            else:
+                clim = None
+
+            handle = partial(
+                GeometricACC,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+                batch_reduction="sum",
+                method="macro",
+                bias=clim,
+                spatial_distributed=self.spatial_distributed,
+            )
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="ACC",
+                    metric_channels=self.acc_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    integrate=True,
+                    report_metric=True,
+                )
+            )
+            self.acc_curve = self.metric_handles[-1].rollout_curve
+
+        if self.crps_var_names:
+            handle = partial(
+                GeometricCRPS,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                crps_type="skillspread",
+                channel_reduction="none",
+                batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+                ensemble_distributed=self.ensemble_distributed,
+            )
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="CRPS",
+                    metric_channels=self.crps_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    scale=scale.reshape(-1),
+                    integrate=False,
+                    report_metric=True,
+                )
+            )
+            self.crps_curve = self.metric_handles[-1].rollout_curve
+
+        if self.spread_var_names:
+            handle = partial(
+                GeometricSpread,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+                batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+                ensemble_distributed=self.ensemble_distributed,
+            )
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="Spread",
+                    metric_channels=self.spread_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    scale=scale.reshape(-1),
+                    integrate=False,
+                    report_metric=True,
+                )
+            )
+
+        if self.ssr_var_names:
+            handle = partial(
+                GeometricSSR,
+                grid_type=grid_type,
+                img_shape=self.img_shape,
+                crop_shape=self.crop_shape,
+                crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+                batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+                ensemble_distributed=self.ensemble_distributed,
+            )
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="SSR",
+                    metric_channels=self.ssr_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    integrate=False,
+                    report_metric=True,
+                )
+            )
+            self.ssr_curve = self.metric_handles[-1].rollout_curve
+
+        if self.rh_var_names:
+            handle = partial(
+	        GeometricRankHistogram,
+	        grid_type=grid_type,
+	        img_shape=self.img_shape,
+	        crop_shape=self.crop_shape,
+	        crop_offset=self.crop_offset,
+                normalize=True,
+                channel_reduction="none",
+		batch_reduction="sum",
+                spatial_distributed=self.spatial_distributed,
+                ensemble_distributed=self.ensemble_distributed,
+            )
+
+            # get ensemble size:
+            ens_size = params.get("ensemble_size", 1)
+
+            self.metric_handles.append(
+                MetricRollout(
+                    metric_name="Rank Histogram",
+                    metric_channels=self.rh_var_names,
+                    metric_handle=handle,
+                    channel_names=self.channel_names,
+                    num_rollout_steps=self.num_rollout_steps,
+                    dtphys=self.dtxdh,
+                    device=self.device,
+                    aux_shape=(ens_size+1,),
+                    aux_shape_finalized=(ens_size+1,),
+                    integrate=False,
+                    report_metric=False,
+                )
+            )
+            self.rh_curve = self.metric_handles[-1].rollout_curve
+
+        # we need gather shapes
         if comm.get_size("spatial") > 1:
-            self.do_gather_input = True
             self.gather_shapes_h = compute_split_shapes(self.crop_shape[0], comm.get_size("h"))
             self.gather_shapes_w = compute_split_shapes(self.crop_shape[1], comm.get_size("w"))
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=False)
     def _gather_input(self, x: torch.Tensor) -> torch.Tensor:
         """gather and crop the data"""
 
-        xh = gather_from_parallel_region(x, -2, self.gather_shapes_h, "h")
-        x = gather_from_parallel_region(xh, -1, self.gather_shapes_w, "w")
+        if comm.get_size("h") > 1:
+            x = gather_from_parallel_region(x, -2, self.gather_shapes_h, "h")
+
+        if comm.get_size("w") > 1:
+            x = gather_from_parallel_region(x, -1, self.gather_shapes_w, "w")
 
         return x
 
     def initialize_buffers(self):
-        """initialize buffers for computing ACC, RMSE, ACC AUC curves"""
+        """initialize buffers for computing metrics"""
 
         # initialize buffers for the validation metrics
-        self.valid_buffer = torch.zeros((3), dtype=torch.float32, device=self.device)
+        self.valid_buffer = torch.zeros((2), dtype=torch.float32, device=self.device)
         self.valid_loss = self.valid_buffer[0].view(-1)
-        self.valid_l1 = self.valid_buffer[1].view(-1)
-        self.valid_steps = self.valid_buffer[2].view(-1)
-
-        # we need these buffers
-        self.acc_curve = torch.zeros((self.out_channels_local, self.valid_autoreg_steps + 1), dtype=torch.float32, device=self.device)
-        self.rmse_curve = torch.zeros((self.out_channels_local, self.valid_autoreg_steps + 1), dtype=torch.float32, device=self.device)
-        self.acc_counter = torch.zeros((self.valid_autoreg_steps + 1), dtype=torch.float32, device=self.device)
-
-        # create CPU copies for all the buffers
-        pin_memory = self.device.type == "cuda"
-        self.valid_buffer_cpu = torch.zeros((3), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self.acc_curve_cpu = torch.zeros((self.out_channels_local, self.valid_autoreg_steps + 1), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self.acc_auc_cpu = torch.zeros((self.out_channels_local), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self.rmse_curve_cpu = torch.zeros((self.out_channels_local, self.valid_autoreg_steps + 1), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
+        self.valid_steps = self.valid_buffer[1].view(-1)
 
     def zero_buffers(self):
         """set buffers to zero"""
 
-        with torch.inference_mode():
-            with torch.no_grad():
-                self.valid_buffer.fill_(0)
-                self.acc_curve.fill_(0)
-                self.rmse_curve.fill_(0)
-                self.acc_counter.fill_(0)
+        with torch.no_grad():
+            self.valid_buffer.fill_(0)
+
+        for handle in self.metric_handles:
+            handle.zero_buffers()
+
         return
 
-    def update(self, prediction, target, loss, idt):
+    def update(self, prediction, target, loss, idt, weight=None):
         """update function to update buffers on each autoregressive rollout step"""
 
-        if self.do_gather_input:
-            prediction = self._gather_input(prediction)
-            target = self._gather_input(target)
+        if prediction.dim() == 5:
+            prediction_mean = torch.mean(prediction, dim=1)
+            if self.ensemble_distributed:
+                prediction_mean = reduce_from_parallel_region(prediction_mean, "ensemble") / float(comm.get_size("ensemble"))
+        else:
+            prediction_mean = prediction
+            prediction = prediction.unsqueeze(1)
 
-        # update parameters
-        self.acc_curve[:, idt] += self.acc_handle(prediction - self.clim, target - self.clim)
-        self.rmse_curve[:, idt] += self.mult * torch.sum(self.rmse_handle(prediction, target), dim=0)
-        self.acc_counter[idt] += 1
+        for handle in self.metric_handles:
+            if handle.type == LossType.Deterministic:
+                handle.update(prediction_mean, target, idt, weight)
+            elif handle.type == LossType.Probabilistic:
+                handle.update(prediction, target, idt, weight)
+            else:
+                raise NotImplementedError(f"Error, LossType {handle.type} not implemented.")
 
         # only update this at the first step
         if idt == 0:
             self.valid_steps += 1.0
             self.valid_loss += loss
-            self.valid_l1 += self.l1_handle(prediction, target)
 
         return
 
-    def finalize(self, final_inference=False):
+    def finalize(self):
         """Finalize routine to gather all of the metrics to rank 0 and assemble logs"""
 
         # sync here
@@ -211,96 +582,85 @@ class MetricsHandler:
             dist.barrier(device_ids=[self.device.index])
 
         with torch.no_grad():
-            valid_steps_local = int(self.valid_steps.item())
 
-            if dist.is_initialized():
-                dist.all_reduce(self.valid_buffer, op=dist.ReduceOp.SUM, group=comm.get_group("data"))
-                dist.all_reduce(self.acc_curve, op=dist.ReduceOp.SUM, group=comm.get_group("data"))
-                dist.all_reduce(self.rmse_curve, op=dist.ReduceOp.SUM, group=comm.get_group("data"))
-                dist.all_reduce(self.acc_counter, op=dist.ReduceOp.SUM, group=comm.get_group("data"))
-
-            # gather from matmul parallel ranks
-            if self.split_data_channels:
-                # reduce l1
-                dist.all_reduce(valid_l1, op=dist.ReduceOp.AVG, group=comm.get_group("matmul"))
-
-                # gather acc curves
-                acc_curve_list = torch.split(
-                    torch.zeros((self.N_out_channels, self.valid_autoreg_steps + 1), dtype=torch.float32, device=self.device), self.out_channels_local, dim=0
-                )
-                acc_curve_list = [x.contiguous() for x in acc_curve_list]
-                acc_curve_list[comm.get_rank("matmul")] = self.acc_curve
-                dist.all_gather(acc_curve_list, self.acc_curve, group=comm.get_group("matmul"))
-                self.acc_curve = torch.cat(acc_curve_list, dim=0)
-
-                # gather acc curves
-                rmse_curve_list = torch.split(
-                    torch.zeros((self.N_out_channels, self.valid_autoreg_steps + 1), dtype=torch.float32, device=self.device), self.out_channels_local, dim=0
-                )
-                rmse_curve_list = [x.contiguous() for x in rmse_curve_list]
-                rmse_curve_list[comm.get_rank("matmul")] = self.rmse_curve
-                dist.all_gather(rmse_curve_list, self.rmse_curve, group=comm.get_group("matmul"))
-                self.rmse_curve = torch.cat(rmse_curve_list, dim=0)
-
-            # divide by number of steps
-            self.valid_buffer[0:2] = self.valid_buffer[0:2] / self.valid_buffer[2]
-
-            # Pull out autoregessive acc values
-            self.acc_curve /= self.acc_counter
-            self.rmse_curve /= self.acc_counter
-
-            # compute auc:
-            acc_auc = self.simpquad(self.acc_curve, dim=1)
-
-            # copy buffers to cpu
-            # sync on stream
             if self.stream is not None:
                 self.stream.wait_stream(torch.cuda.current_stream())
 
-            # schedule copy
+            # reductions
             with torch.cuda.stream(self.stream):
-                self.valid_buffer_cpu.copy_(self.valid_buffer, non_blocking=True)
-                self.acc_curve_cpu.copy_(self.acc_curve, non_blocking=True)
-                self.rmse_curve_cpu.copy_(self.rmse_curve, non_blocking=True)
-                self.acc_auc_cpu.copy_(acc_auc, non_blocking=True)
 
-            # wait for stream
+                if dist.is_initialized():
+                    req = dist.all_reduce(self.valid_buffer, op=dist.ReduceOp.SUM, group=comm.get_group("batch"), async_op=True)
+                    req.wait()
+
+                for handle in self.metric_handles:
+                    handle.reduce(non_blocking=True)
+
+            # finalize computations
+            with torch.cuda.stream(self.stream):
+
+                self.valid_loss /= self.valid_steps
+
+                for handle in self.metric_handles:
+                    handle.finalize(non_blocking=True)
+
             if self.stream is not None:
                 self.stream.synchronize()
 
             # prepare logs with the minimum content
-            valid_buffer_arr = self.valid_buffer_cpu.numpy()
-            logs = {"base": {"validation steps": valid_steps_local, "validation loss": valid_buffer_arr[0], "validation L1": valid_buffer_arr[1]}, "metrics": {}}
+            valid_loss = self.valid_loss.item()
+            valid_steps = self.valid_steps.item()
+            logs = {"base": {"validation steps": valid_steps, "validation loss": valid_loss}, "metrics": {}}
 
-            # scalar metrics
-            valid_rmse_arr = self.rmse_curve_cpu[:, 0].numpy()
-            for var_name, var_idx in self.rmse_vars.items():
-                logs["metrics"]["validation " + var_name] = valid_rmse_arr[var_idx]
-
-            acc_auc_arr = self.acc_auc_cpu.numpy()
-            for var_name, var_idx in self.acc_auc_vars.items():
-                logs["metrics"]["ACC AUC " + var_name] = acc_auc_arr[var_idx]
-
-            # table
             table_data = []
-            acc_curve_arr = self.acc_curve_cpu.numpy()
-            for var_name, var_idx in self.acc_vars.items():
-                # create table
-                for d in range(0, self.valid_autoreg_steps + 1):
-                    table_data.append(["ACC", f"{var_name}", (d + 1) * self.dtxdh, acc_curve_arr[var_idx, d]])
+            for handle in self.metric_handles:
 
-            rmse_curve_arr = self.rmse_curve_cpu.numpy()
-            for var_name, var_idx in self.rmse_vars.items():
-                # create table
-                for d in range(0, self.valid_autoreg_steps + 1):
-                    table_data.append(["RMSE", f"{var_name}", (d + 1) * self.dtxdh, rmse_curve_arr[var_idx, d]])
+                if handle.metric_name != "ACC":
+                    # report single step
+                    tmplog = handle.report(index=0, table=False)
+                    for key in tmplog:
+                        logs["metrics"]["validation " + key] = tmplog[key]
+
+                # report final rollout step
+                tmplog, tmptable = handle.report(index=self.num_rollout_steps - 1, table=True)
+                for key in tmplog:
+                    logs["metrics"]["validation " + key] = tmplog[key]
+                table_data += tmptable
 
             # add table
             logs["metrics"]["rollouts"] = wandb.Table(data=table_data, columns=["metric type", "variable name", "time [h]", "value"])
 
         self.logs = logs
 
-        if final_inference:
-            return logs, self.acc_curve, self.rmse_curve
-        else:
-            return logs
+        return logs
+
+    def save(self, metrics_file: str):
+        """Save metrics to an output hdf5 file"""
+
+        # write everything into an output file
+        metrics_file = h5.File(metrics_file, "w")
+
+        # iterate over handles and write the output to the h5py file
+        for handle in self.metric_handles:
+            # create group
+            handle_name = handle.metric_name
+            handle_group = metrics_file.create_group(handle.metric_name)
+
+            # write data
+            handle_group.create_dataset("metric_data", data=handle.rollout_curve_cpu.numpy())
+
+            # make dimension scales
+            dset = handle_group.create_dataset("channel", data=handle.metric_channels)
+            dset.make_scale("channel")
+            dset = handle_group.create_dataset("lead_time", data=handle.dtphys * torch.arange(1, handle.num_rollout_steps+1).numpy())
+            dset.make_scale("lead_time")
+
+            # annotate
+            handle_group["metric_data"].dims[0].attach_scale(handle_group["lead_time"])
+            handle_group["metric_data"].dims[0].label = "Lead time relative to timestamp"
+            handle_group["metric_data"].dims[1].attach_scale(handle_group["channel"])
+            handle_group["metric_data"].dims[1].label = "Channel name"
+
+        metrics_file.close()
+
+        return

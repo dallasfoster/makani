@@ -16,6 +16,9 @@
 install:
 	pip install --upgrade pip && pip install -e .
 
+install-no-deps:
+	pip install --upgrade pip && pip install --no-deps -e .
+
 wheel:
 	pip install --upgrade pip && pip wheel . --no-deps
 

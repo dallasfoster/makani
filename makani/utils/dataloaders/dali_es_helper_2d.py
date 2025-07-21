@@ -17,9 +17,8 @@ import time
 import sys
 import os
 import glob
+from functools import partial
 import numpy as np
-import cupy as cp
-import cupyx as cpx
 import h5py
 import zarr
 import logging
@@ -30,12 +29,12 @@ from bisect import bisect_right
 # for nvtx annotation
 import torch
 
-# we need this for the zenith angle feature
-import datetime
-import pytz
-
 # import splitting logic
-from modulus.distributed.utils import compute_split_shapes
+from physicsnemo.distributed.utils import compute_split_shapes
+
+# data helpers
+from .data_helpers import get_timestamp, get_date_from_timestamp, get_default_aws_connector
+
 
 class GeneralES(object):
     def _get_slices(self, lst):
@@ -67,9 +66,11 @@ class GeneralES(object):
         truncate_old=True,
         enable_logging=True,
         zenith_angle=True,
+        return_timestamp=False,
         lat_lon=None,
         dataset_path="fields",
         enable_odirect=False,
+        enable_s3=False,
         seed=333,
         is_parallel=True,
     ):
@@ -95,12 +96,42 @@ class GeneralES(object):
         self.shard_id = shard_id
         self.is_parallel = is_parallel
         self.zenith_angle = zenith_angle
+        self.return_timestamp = return_timestamp
         self.dataset_path = dataset_path
         self.lat_lon = lat_lon
 
-        # O_DIRECT specific stuff
-        self.file_driver = "direct" if enable_odirect else None
-        self.read_direct = True  # if enable_odirect else True
+        # also obtain an ordered channels list, required for h5py:
+        # in_channels
+        self.in_channels_sorted = np.sort(self.in_channels)
+        self.in_channels_unsort = np.argsort(np.argsort(self.in_channels))
+        self.in_channels_is_sorted = np.all(self.in_channels_sorted == self.in_channels)
+        # out_channels
+        self.out_channels_sorted = np.sort(self.out_channels)
+        self.out_channels_unsort = np.argsort(np.argsort(self.out_channels))
+        self.out_channels_is_sorted = np.all(self.out_channels_sorted == self.out_channels)
+
+        # sanity checks
+        if enable_odirect and enable_s3:
+            raise NotImplementedError("The setting enable_odirect and enable_s3 are mutually exclusive.")
+
+        # O_DIRECT and S3 specific stuff
+        self.enable_s3 = enable_s3
+        self.file_driver = None
+        self.file_driver_kwargs = {}
+        self.aws_connector = None
+        if enable_odirect:
+            self.file_driver = "direct"
+
+        if enable_s3:
+            self.file_driver = "ros3"
+            self.aws_connector = get_default_aws_connector(None)
+            self.file_driver_kwargs = dict(
+                aws_region=bytes(self.aws_connector.aws_region_name, "utf-8"),
+                secret_id=bytes(self.aws_connector.aws_access_key_id, "utf-8"),
+                secret_key=bytes(self.aws_connector.aws_secret_access_key, "utf-8"),
+            )
+
+        self.read_direct = True if not self.enable_s3 else False
         self.num_retries = 5
 
         # set the read slices
@@ -111,50 +142,85 @@ class GeneralES(object):
 
         # parse the files
         self._get_files_stats(enable_logging)
+
+        # set shuffling to true or false
         self.shuffle = True if train else False
 
         # convert in_channels to list of slices:
-        self.in_channels_slices = list(self._get_slices(self.in_channels))
-        self.out_channels_slices = list(self._get_slices(self.out_channels))
+        self.in_channels_slices = list(self._get_slices(self.in_channels_sorted))
+        self.out_channels_slices = list(self._get_slices(self.out_channels_sorted))
 
         # we need some additional static fields in this case
         if self.lat_lon is None:
-            resolution = 360.0 / float(self.img_shape[1])
-            longitude = np.arange(0, 360, resolution)
-            latitude = np.arange(-90, 90 + resolution, resolution)
-            latitude = latitude[::-1]
+            latitude = np.linspace(90, -90, self.img_shape[0], endpoint=True)
+            longitude = np.linspace(0, 360, self.img_shape[1], endpoint=False)
             self.lat_lon = (latitude.tolist(), longitude.tolist())
 
-        if self.zenith_angle:
-            latitude = np.array(self.lat_lon[0])
-            longitude = np.array(self.lat_lon[1])
-            self.lon_grid, self.lat_grid = np.meshgrid(longitude, latitude)
-            self.lat_grid_local = self.lat_grid[self.read_anchor[0] : self.read_anchor[0] + self.read_shape[0], self.read_anchor[1] : self.read_anchor[1] + self.read_shape[1]]
-            self.lon_grid_local = self.lon_grid[self.read_anchor[0] : self.read_anchor[0] + self.read_shape[0], self.read_anchor[1] : self.read_anchor[1] + self.read_shape[1]]
+        # compute local grid
+        latitude = np.array(self.lat_lon[0])
+        longitude = np.array(self.lat_lon[1])
+        self.lon_grid, self.lat_grid = np.meshgrid(longitude, latitude)
+        self.lat_grid_local = self.lat_grid[self.read_anchor[0] : self.read_anchor[0] + self.read_shape[0], self.read_anchor[1] : self.read_anchor[1] + self.read_shape[1]]
+        self.lon_grid_local = self.lon_grid[self.read_anchor[0] : self.read_anchor[0] + self.read_shape[0], self.read_anchor[1] : self.read_anchor[1] + self.read_shape[1]]
+        self.lat_lon_local = (
+            latitude[self.read_anchor[0] : self.read_anchor[0] + self.read_shape[0]].tolist(),
+            longitude[self.read_anchor[1] : self.read_anchor[1] + self.read_shape[1]].tolist(),
+        )
+
+        # datetime logic
+        self.date_fn = np.vectorize(get_date_from_timestamp)
+
+        return
+
+    def _reorder_channels(self, inp, tar):
+        # reorder data if requested:
+	# inp
+        if not self.in_channels_is_sorted:
+            inp_re = inp[:, self.in_channels_unsort, ...].copy()
+        else:
+            inp_re = inp.copy()
+
+        # tar
+        if not self.out_channels_is_sorted:
+            tar_re = tar[:, self.out_channels_unsort, ...].copy()
+        else:
+            tar_re = tar.copy()
+
+        return inp_re, tar_re
 
     # HDF5 routines
     def _get_stats_h5(self, enable_logging):
-        with h5py.File(self.files_paths[0], "r") as _f:
+
+        if not self.enable_s3:
+            fopen_handle = partial(h5py.File, mode="r")
+        else:
+            fopen_handle = partial(h5py.File, mode="r", driver=self.file_driver, **self.file_driver_kwargs)
+
+        self.n_samples_year = []
+        with fopen_handle(self.files_paths[0]) as _f:
             if enable_logging:
                 logging.info("Getting file stats from {}".format(self.files_paths[0]))
             # original image shape (before padding)
             self.img_shape = _f[self.dataset_path].shape[2:4]
             self.total_channels = _f[self.dataset_path].shape[1]
+            self.n_samples_year.append(_f[self.dataset_path].shape[0])
 
         # get all sample counts
-        self.n_samples_year = []
-        for filename in self.files_paths:
-            with h5py.File(filename, "r") as _f:
+        for filename in self.files_paths[1:]:
+            with fopen_handle(filename) as _f:
                 self.n_samples_year.append(_f[self.dataset_path].shape[0])
+
         return
 
     def _get_year_h5(self, year_idx):
         # here we want to use the specific file driver
-        self.files[year_idx] = h5py.File(self.files_paths[year_idx], "r", driver=self.file_driver)
+        self.files[year_idx] = h5py.File(self.files_paths[year_idx], "r", driver=self.file_driver, **self.file_driver_kwargs)
         self.dsets[year_idx] = self.files[year_idx][self.dataset_path]
         return
 
-    def _get_data_h5(self, inp, tar, dset, local_idx, start_x, end_x, start_y, end_y):
+    def _get_data_h5(self, dset, local_idx, start_x, end_x, start_y, end_y):
+
+        # input
         off = 0
         for slice_in in self.in_channels_slices:
             start = off
@@ -162,13 +228,15 @@ class GeneralES(object):
 
             # read the data
             if self.read_direct:
-                dset.read_direct(inp, np.s_[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y], np.s_[:, start:end, ...])
+                dset.read_direct(
+                    self.inp_buff, np.s_[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y], np.s_[:, start:end, ...])
             else:
-                inp[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y] = dset[:, start:end, ...]
+                self.inp_buff[:, start:end, ...] = dset[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y]
 
             # update offset
             off = end
 
+        # target
         off = 0
         for slice_out in self.out_channels_slices:
             start = off
@@ -177,13 +245,16 @@ class GeneralES(object):
             # read the data
             if self.read_direct:
                 dset.read_direct(
-                    tar, np.s_[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y], np.s_[:, start:end, ...]
+                    self.tar_buff, np.s_[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y], np.s_[:, start:end, ...]
                 )
             else:
-                tar[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y] = dset[:, start:end, ...]
+                 self.tar_buff[:, start:end, ...] = dset[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y]
 
             # update offset
             off = end
+
+        # reorder data if requested:
+        inp, tar = self._reorder_channels(self.inp_buff, self.tar_buff)
 
         return inp, tar
 
@@ -208,20 +279,23 @@ class GeneralES(object):
         self.dsets[year_idx] = self.files[year_idx][f"/{self.dataset_path}"]
         return
 
-    def _get_data_zarr(self, inp, tar, dset, local_idx, start_x, end_x, start_y, end_y):
+    def _get_data_zarr(self, dset, local_idx, start_x, end_x, start_y, end_y):
         off = 0
         for slice_in in self.in_channels_slices:
             start = off
             end = start + (slice_in.stop - slice_in.start)
-            inp[:, start:end, ...] = dset[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y]
+            self.inp_buff[:, start:end, ...] = dset[(local_idx - self.dt * self.n_history) : (local_idx + 1) : self.dt, slice_in, start_x:end_x, start_y:end_y]
             off = end
 
         off = 0
         for slice_out in self.out_channels_slices:
             start = off
             end = start + (slice_out.stop - slice_out.start)
-            tar[:, start:end, ...] = dset[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y]
+            self.tar_buff[:, start:end, ...] = dset[(local_idx + self.dt) : (local_idx + self.dt * (self.n_future + 1) + 1) : self.dt, slice_out, start_x:end_x, start_y:end_y]
             off = end
+
+        # reorder data if requested:
+        inp, tar = self._reorder_channels(self.inp_buff, self.tar_buff)
 
         return inp, tar
 
@@ -229,18 +303,36 @@ class GeneralES(object):
         # check for hdf5 files
         self.files_paths = []
         self.location = [self.location] if not isinstance(self.location, list) else self.location
-        for location in self.location:
-            self.files_paths = self.files_paths + glob.glob(os.path.join(location, "????.h5"))
-        self.file_format = "h5"
 
-        # check for zarr files if no hdf5 files are found
-        if not self.files_paths:
+        if not self.enable_s3:
+            # check if we are dealing with hdf5 or zarr files
             for location in self.location:
-                self.files_paths = self.files_paths + glob.glob(os.path.join(location, "????.zarr"))
-            self.file_format = "zarr"
+                self.files_paths = self.files_paths + glob.glob(os.path.join(location, "????.h5"))
 
+            # check for zarr files if no hdf5 files are found
+            if self.files_paths:
+                self.file_format = "h5"
+            else:
+                for location in self.location:
+                    self.files_paths = self.files_paths + glob.glob(os.path.join(location, "????.zarr"))
+                if self.files_paths:
+                    self.file_format = "zarr"
+        else:
+            files_paths = self.aws_connector.list_bucket(self.location)
+
+            for fpath in files_paths:
+                if fpath.endswith(".h5"):
+                    # prepend the endpoint
+                    fpathp = self.aws_connector.aws_endpoint_url + "/" + fpath
+                    self.files_paths.append(fpathp)
+
+            if self.files_paths:
+                self.file_format = "h5"
+
+        # check if some files have been found
         if not self.files_paths:
-            raise IOError(f"Error, the specified file path {self.location} does neither container h5 nor zarr files.")
+            locstring = ", ".join(self.location)
+            raise IOError(f"Error, the specified file path(s) {locstring} do neither container h5 nor zarr files.")
 
         # sort the files
         self.files_paths.sort()
@@ -268,11 +360,11 @@ class GeneralES(object):
         # for x
         split_shapes_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])
         read_shape_x = split_shapes_x[self.io_rank[0]]
-        read_anchor_x = self.crop_anchor[0] + sum(split_shapes_x[:self.io_rank[0]]) #self.crop_anchor[0] + read_shape_x * self.io_rank[0]
+        read_anchor_x = self.crop_anchor[0] + sum(split_shapes_x[: self.io_rank[0]])
         # for y
         split_shapes_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])
         read_shape_y = split_shapes_y[self.io_rank[1]]
-        read_anchor_y = self.crop_anchor[1] + sum(split_shapes_y[:self.io_rank[1]]) #self.crop_anchor[1] + read_shape_y * self.io_rank[1]
+        read_anchor_y = self.crop_anchor[1] + sum(split_shapes_y[: self.io_rank[1]])
         self.read_anchor = [read_anchor_x, read_anchor_y]
         self.read_shape = [read_shape_x, read_shape_y]
 
@@ -288,9 +380,9 @@ class GeneralES(object):
         # do the sharding
         self.n_samples_shard = self.n_samples_total // self.num_shards
         if self.truncate_old:
-            self.n_samples_offset = self.n_samples_available - self.n_samples_total
+            self.n_samples_offset = max(self.dt * self.n_history, self.n_samples_available - self.n_samples_total - self.dt * (self.n_future + 1) - 1)
         else:
-            self.n_samples_offset = 0
+            self.n_samples_offset = self.dt * self.n_history
 
         # number of steps per epoch
         self.num_steps_per_cycle = self.n_samples_shard // self.batch_size
@@ -316,6 +408,11 @@ class GeneralES(object):
                     self.n_samples_total, self.n_samples_per_epoch, self.num_steps_per_epoch, self.num_shards, self.batch_size
                 )
             )
+            start_lidx, start_yidx = self._get_local_year_index_from_global_index(self.n_samples_offset)
+            end_lidx, end_yidx = self._get_local_year_index_from_global_index(self.n_samples_available-1)
+            start_date = get_timestamp(self.years[start_yidx], hour=(start_lidx * self.dhours))
+            end_date = get_timestamp(self.years[end_yidx], hour=(end_lidx * self.dhours))
+            logging.info(f"Date range for data set: {start_date} to {end_date}.")
             logging.info("Delta t: {} hours".format(self.dhours * self.dt))
             logging.info("Including {} hours of past history in training at a frequency of {} hours".format(self.dhours * self.dt * (self.n_history + 1), self.dhours * self.dt))
             logging.info("Including {} hours of future targets in training at a frequency of {} hours".format(self.dhours * self.dt * (self.n_future + 1), self.dhours * self.dt))
@@ -329,57 +426,44 @@ class GeneralES(object):
             self._init_buffers()
 
     def _init_buffers(self):
-        # set device
-        self.device = cp.cuda.Device(self.device_id)
-        self.device.use()
-        self.current_buffer = 0
-        self.inp_buffs = [
-            cpx.zeros_pinned((self.n_history + 1, self.n_in_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-            cpx.zeros_pinned((self.n_history + 1, self.n_in_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-        ]
-        self.tar_buffs = [
-            cpx.zeros_pinned((self.n_future + 1, self.n_out_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-            cpx.zeros_pinned((self.n_future + 1, self.n_out_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-        ]
-        if self.zenith_angle:
-            self.zen_inp_buffs = [
-                cpx.zeros_pinned((self.n_history + 1, 1, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-                cpx.zeros_pinned((self.n_history + 1, 1, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-            ]
-            self.zen_tar_buffs = [
-                cpx.zeros_pinned((self.n_future + 1, 1, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-                cpx.zeros_pinned((self.n_future + 1, 1, self.read_shape[0], self.read_shape[1]), dtype=np.float32),
-            ]
+        self.inp_buff = np.zeros((self.n_history + 1, self.n_in_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32)
+        self.tar_buff = np.zeros((self.n_future + 1, self.n_out_channels, self.read_shape[0], self.read_shape[1]), dtype=np.float32)
 
-    def _compute_zenith_angle(self, zen_inp, zen_tar, local_idx, year_idx):
+    def _compute_timestamps(self, local_idx, year_idx):
+        # compute hours into the year
+        year = self.years[year_idx]
+
+        inp_time = np.asarray([get_timestamp(year, hour=(idx * self.dhours)).timestamp() for idx in range(local_idx - self.dt * self.n_history, local_idx + 1, self.dt)])
+
+        tar_time = np.asarray([get_timestamp(year, hour=(idx * self.dhours)).timestamp() for idx in range(local_idx + self.dt, local_idx + self.dt * (self.n_future + 1) + 1, self.dt)])
+
+        return inp_time, tar_time
+
+    def _compute_zenith_angle(self, inp_times, tar_times):
         # nvtx range
         torch.cuda.nvtx.range_push("GeneralES:_compute_zenith_angle")
 
         # import
         from makani.third_party.climt.zenith_angle import cos_zenith_angle
 
-        # compute hours into the year
-        year = self.years[year_idx]
-        jan_01_epoch = datetime.datetime(year, 1, 1, 0, 0, 0, tzinfo=pytz.utc)
+        # convert to datetimes:
+        inp_times_dt = self.date_fn(inp_times)
+        tar_times_dt = self.date_fn(tar_times)
 
         # zenith angle for input
-        inp_times = np.asarray([jan_01_epoch + datetime.timedelta(hours=idx * self.dhours) for idx in range(local_idx - self.dt * self.n_history, local_idx + 1, self.dt)])
-        cos_zenith_inp = np.expand_dims(cos_zenith_angle(inp_times, self.lon_grid_local, self.lat_grid_local).astype(np.float32), axis=1)
-        zen_inp[...] = cos_zenith_inp[...]
+        cos_zenith_inp = np.expand_dims(cos_zenith_angle(inp_times_dt, self.lon_grid_local, self.lat_grid_local).astype(np.float32), axis=1)
 
         # zenith angle for target:
-        tar_times = np.asarray(
-            [jan_01_epoch + datetime.timedelta(hours=idx * self.dhours) for idx in range(local_idx + self.dt, local_idx + self.dt * (self.n_future + 1) + 1, self.dt)]
-        )
-        cos_zenith_tar = np.expand_dims(cos_zenith_angle(tar_times, self.lon_grid_local, self.lat_grid_local).astype(np.float32), axis=1)
-        zen_tar[...] = cos_zenith_tar[...]
+        cos_zenith_tar = np.expand_dims(cos_zenith_angle(tar_times_dt, self.lon_grid_local, self.lat_grid_local).astype(np.float32), axis=1)
 
         # nvtx range
         torch.cuda.nvtx.range_pop()
 
-        return
+        return cos_zenith_inp, cos_zenith_tar 
 
     def __getstate__(self):
+        del self.aws_connector
+        self.aws_connector = None
         return self.__dict__.copy()
 
     def __setstate__(self, state):
@@ -392,6 +476,10 @@ class GeneralES(object):
             self.get_year_handle = self._get_year_zarr
             self.get_data_handle = self._get_data_zarr
 
+        # re-create members which are needed
+        if self.enable_s3 and (self.aws_connector is None):
+            self.aws_connector = get_default_aws_connector(None)
+
         if self.is_parallel:
             self._init_buffers()
 
@@ -400,9 +488,15 @@ class GeneralES(object):
 
     def __del__(self):
         # close files
-        for f in self.files:
-            if f is not None:
-                f.close()
+        if hasattr(self, "files"):
+            for f in self.files:
+                if f is not None:
+                    f.close()
+
+    def _get_local_year_index_from_global_index(self, sample_idx):
+        year_idx = bisect_right(self.year_offsets, sample_idx) - 1  # subtract 1 because we do 0-based indexing
+        local_idx = sample_idx - self.year_offsets[year_idx]
+        return local_idx, year_idx
 
     def __call__(self, sample_info):
         # compute global iteration index:
@@ -434,8 +528,7 @@ class GeneralES(object):
 
         # determine local and sample idx
         sample_idx = self.index_permutation[cycle_sample_idx]
-        year_idx = bisect_right(self.year_offsets, sample_idx) - 1  # subtract 1 because we do 0-based indexing
-        local_idx = sample_idx - self.year_offsets[year_idx]
+        local_idx, year_idx = self._get_local_year_index_from_global_index(sample_idx)
 
         # if we are not at least self.dt*n_history timesteps into the prediction
         if local_idx < self.dt * self.n_history:
@@ -445,6 +538,7 @@ class GeneralES(object):
             local_idx = self.n_samples_year[year_idx] - self.dt * (self.n_future + 1) - 1
 
         if self.files[year_idx] is None:
+
             for _ in range(self.num_retries):
                 try:
                     self.get_year_handle(year_idx)
@@ -454,14 +548,6 @@ class GeneralES(object):
                     time.sleep(5)
             else:
                 raise OSError(f"Unable to retrieve year handle {year_idx}, aborting.")
-
-        # handles to buffers
-        inp = self.inp_buffs[self.current_buffer]
-        tar = self.tar_buffs[self.current_buffer]
-        if self.zenith_angle:
-            zen_inp = self.zen_inp_buffs[self.current_buffer]
-            zen_tar = self.zen_tar_buffs[self.current_buffer]
-        self.current_buffer = (self.current_buffer + 1) % 2
 
         # do the read
         dset = self.dsets[year_idx]
@@ -474,14 +560,21 @@ class GeneralES(object):
         end_y = start_y + self.read_shape[1]
 
         # read data
-        inp, tar = self.get_data_handle(inp, tar, dset, local_idx, start_x, end_x, start_y, end_y)
+        inp, tar = self.get_data_handle(dset, local_idx, start_x, end_x, start_y, end_y)
 
-        # get time grid
+        # compute time stamps
+        if self.zenith_angle or self.return_timestamp:
+            inp_time, tar_time = self._compute_timestamps(local_idx, year_idx)
+
+        # construct result tuple
+        result = (inp, tar)
+
         if self.zenith_angle:
-            self._compute_zenith_angle(zen_inp, zen_tar, local_idx, year_idx)
-            result = inp, tar, zen_inp, zen_tar
-        else:
-            result = inp, tar
+            zen_inp, zen_tar = self._compute_zenith_angle(inp_time, tar_time)
+            result = result + (zen_inp, zen_tar)
+
+        if self.return_timestamp:
+            result = result + (inp_time, tar_time)
 
         torch.cuda.nvtx.range_pop()
 

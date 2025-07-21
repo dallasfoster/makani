@@ -18,16 +18,33 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch._utils import _flatten_dense_tensors
 
+from physicsnemo.distributed.utils import split_tensor_along_dim
 from makani.utils import comm
-from modulus.distributed.utils import split_tensor_along_dim
 
 
+def _transpose(tensor, dim0, dim1, dim1_split_sizes, group=None, async_op=False):
 
-def get_memory_format(tensor):
-    if tensor.is_contiguous(memory_format=torch.channels_last):
-        return torch.channels_last
-    else:
-        return torch.contiguous_format
+    # get comm params
+    comm_size = dist.get_world_size(group=group)
+    comm_rank = dist.get_rank(group=group)
+
+    # split and local transposition
+    tsplit = split_tensor_along_dim(tensor, dim=dim0, num_chunks=comm_size)
+    x_send = [y.contiguous() for y in tsplit]
+    x_send_shapes = [x.shape for x in x_send]
+    x_recv = []
+    x_shape = list(x_send_shapes[comm_rank])
+    for dim1_len in dim1_split_sizes:
+        x_shape[dim1] = dim1_len
+        x_recv.append(torch.empty(x_shape, dtype=tensor.dtype, device=tensor.device))
+
+    # global transposition
+    req = dist.all_to_all(x_recv, x_send, group=group, async_op=async_op)
+
+    # get dim0 split sizes
+    dim0_split_sizes = [x[dim0] for x in x_send_shapes]
+
+    return x_recv, dim0_split_sizes, req
 
 
 def gather_uneven(tensor, dim, comm_name):
@@ -70,7 +87,7 @@ def sync_params(model, mode="broadcast"):
                 # tlist = [torch.empty_like(param_real) for x in range(comm.get_size(comm_group))]
                 # tlist[comm.get_rank(comm_group)] = param_real
                 # gather all weights in the comm group
-                dist.broadcast(param_real, src=comm.get_root(comm_group), group=comm.get_group(comm_group))
+                dist.broadcast(param_real, src=comm.get_root(comm_group), group=comm.get_group(comm_group), async_op=False)
                 # use weight of rank 0
                 # important to use copy here otherwise the handle gets detaches from the optimizer
                 if is_complex:
@@ -99,5 +116,10 @@ def sync_params(model, mode="broadcast"):
 
             for comm_group in param.is_shared_mp:
                 _sync_param(param, comm_group, mode)
+
+    # synchronize the device to make sure all copies have finished
+    if dist.is_initialized():
+        device = next(model.parameters()).device
+        dist.barrier(device_ids=[device.index])
 
     return

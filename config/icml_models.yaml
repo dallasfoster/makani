@@ -3,7 +3,7 @@ base_config: &BASE_CONFIG
     # metadata file for the dataset
     metadata_json_path: "/metadata/data.json"
 
-    # data 
+    # data
     train_data_path: "/train"
     valid_data_path: "/test"
     exp_dir: "/runs"
@@ -51,9 +51,7 @@ base_config: &BASE_CONFIG
     dt: 1 # how many timesteps ahead the model will predict
     n_history: 0 #how many previous timesteps to consider
     prediction_type: "iterative"
-    prediction_length: 35 #applicable only if prediction_type == "iterative"
-    n_initial_conditions: 5 #applicable only if prediction_type == "iterative"
-    valid_autoreg_steps: 20 # number of autoregressive steps for validation
+    valid_autoreg_steps: 19 # number of autoregressive steps for validation
 
     ics_type: "specify_number"
     save_raw_forecasts: !!bool True
@@ -67,7 +65,6 @@ base_config: &BASE_CONFIG
 
     N_grid_channels: 0
     gridtype: "sinusoidal" #options "sinusoidal" or "linear"
-    roll: !!bool False
 
     #options default, residual
     target: "default"
@@ -82,7 +79,7 @@ base_config: &BASE_CONFIG
     add_landmask: !!bool False
     landmask_path: /invariants/land_sea_mask.nc
 
-    finetune: !!bool False
+    pretrained: !!bool False
 
     log_to_screen: !!bool True
     log_to_wandb: !!bool True
@@ -135,7 +132,7 @@ sfno_dhealy_26ch_finetune: &SFNO_BASELINE_DHEALY_26CH_FINETUNE
     <<: *SFNO_BASELINE_DHEALY
     lr: 2E-4
     max_epochs: 10
-    finetune: !!bool True
+    pretrained: !!bool True
 
 ###########################################################################################################################
 # ICML Paper models 26 channels
@@ -149,7 +146,7 @@ sfno_dhealy_26ch_2step:
     lr: 1E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/sfno_dhealy_26ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 sfno_dhealy_26ch_filterskip:
@@ -170,7 +167,7 @@ sfno_nonlinear_26ch_2step:
     lr: 1E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/sfno_nonlinear_26ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 fno_linear_26ch: &FNO_LINEAR_26CH
@@ -185,7 +182,7 @@ fno_linear_26ch_2step:
     lr: 1E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/fno_linear_26ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 fno_nonlinear_26ch: &FNO_NONLINEAR_26CH
@@ -200,7 +197,7 @@ fno_nonlinear_26ch_2step:
     lr: 1E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/fno_nonlinear_26ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 ###########################################################################################################################
@@ -210,7 +207,7 @@ fno_nonlinear_26ch_2step:
 sfno_dhealy_73ch: &SFNO_BASELINE_DHEALY_73CH
     <<: *SFNO_BASELINE_DHEALY
     channel_names: ["u10m", "v10m", "u100m", "v100m", "t2m", "sp", "msl", "tcwv", "u50", "u100", "u150", "u200", "u250", "u300", "u400", "u500", "u600", "u700", "u850", "u925", "u1000", "v50", "v100", "v150", "v200", "v250", "v300", "v400", "v500", "v600", "v700", "v850", "v925", "v1000", "z50", "z100", "z150", "z200", "z250", "z300", "z400", "z500", "z600", "z700", "z850", "z925", "z1000", "t50", "t100", "t150", "t200", "t250", "t300", "t400", "t500", "t600", "t700", "t850", "t925", "t1000", "r50", "r100", "r150", "r200", "r250", "r300", "r400", "r500", "r600", "r700", "r850", "r925", "r1000"]
-    
+
     wandb_project: "icml models 73ch"
 
 sfno_dhealy_73ch_2step:
@@ -218,7 +215,7 @@ sfno_dhealy_73ch_2step:
     lr: 2E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/sfno_dhealy_73ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 sfno_nonlinear_73ch: &SFNO_NONLINEAR_73CH
@@ -231,7 +228,7 @@ sfno_nonlinear_73ch_2step:
     lr: 2E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/sfno_nonlinear_73ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 fno_linear_73ch: &FNO_LINEAR_73CH
@@ -246,7 +243,7 @@ fno_linear_73ch_2step:
     lr: 2E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/fno_linear_73ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 fno_nonlinear_73ch: &FNO_NONLINEAR_73CH
@@ -260,7 +257,7 @@ fno_nonlinear_73ch_2step:
     lr: 2E-4
     max_epochs: 5
     scheduler: None
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/runs/fno_nonlinear_73ch/ngpu64_mp1_sp1/training_checkpoints/best_ckpt_mp0.tar"
 
 sfno_dhealy_73ch_layers12_edim256:

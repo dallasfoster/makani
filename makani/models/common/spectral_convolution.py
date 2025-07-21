@@ -19,22 +19,13 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
-from torch.cuda import amp
-
-# import FactorizedTensor from tensorly for tensorized operations
-import tensorly as tl
-
-tl.set_backend("pytorch")
-from tltorch.factorized_tensors.core import FactorizedTensor
+from torch import amp
 
 # import convenience functions for factorized tensors
 from makani.utils import comm
-from makani.models.common.activations import ComplexReLU
-from makani.models.common.contractions import compl_muladd2d_fwd, compl_mul2d_fwd, _contract_rank
+from makani.models.common import ComplexReLU
+from makani.models.common.contractions import _contract_rank
 from makani.models.common.factorizations import get_contract_fun
-
-# for the experimental module
-from makani.models.common.contractions import compl_exp_muladd2d_fwd, compl_exp_mul2d_fwd
 
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
@@ -47,14 +38,18 @@ class SpectralConv(nn.Module):
     domain via the RealFFT2 and InverseRealFFT2 wrappers.
     """
 
-    def __init__(self, forward_transform, inverse_transform, in_channels, out_channels, operator_type="diagonal", separable=False, bias=False, gain=1.0):
-        super(SpectralConv, self).__init__()
+    def __init__(self, forward_transform, inverse_transform, in_channels, out_channels, num_groups=1, operator_type="dhconv", separable=False, bias=False, gain=1.0):
+        super().__init__()
+
+        assert in_channels % num_groups == 0
+        assert out_channels % num_groups == 0
 
         self.forward_transform = forward_transform
         self.inverse_transform = inverse_transform
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.num_groups = num_groups
 
         self.modes_lat = self.inverse_transform.lmax
         self.modes_lon = self.inverse_transform.mmax
@@ -70,10 +65,10 @@ class SpectralConv(nn.Module):
         assert self.inverse_transform.lmax == self.modes_lat
         assert self.inverse_transform.mmax == self.modes_lon
 
-        weight_shape = [in_channels]
+        weight_shape = [num_groups, in_channels // num_groups]
 
         if not self.separable:
-            weight_shape += [out_channels]
+            weight_shape += [out_channels // num_groups]
 
         if isinstance(self.inverse_transform, thd.DistributedInverseRealSHT):
             self.modes_lat_local = self.inverse_transform.l_shapes[comm.get_rank("h")]
@@ -95,7 +90,7 @@ class SpectralConv(nn.Module):
             raise ValueError(f"Unsupported operator type f{self.operator_type}")
 
         # Compute scaling factor for correct initialization
-        scale = math.sqrt(gain / in_channels) * torch.ones(self.modes_lat_local, dtype=torch.complex64)
+        scale = math.sqrt(gain / (in_channels // num_groups)) * torch.ones(self.modes_lat_local, dtype=torch.complex64)
         # seemingly the first weight is not really complex, so we need to account for that
         scale[0] *= math.sqrt(2.0)
         init = scale * torch.randn(*weight_shape, dtype=torch.complex64)
@@ -114,153 +109,34 @@ class SpectralConv(nn.Module):
         # get the contraction handle. This should return a pyTorch contraction
         self._contract = get_contract_fun(self.weight, implementation="factorized", separable=separable, complex=True, operator_type=operator_type)
 
-        if bias == "constant":
+        if bias == True:
             self.bias = nn.Parameter(torch.zeros(1, self.out_channels, 1, 1))
-        elif bias == "position":
-            self.bias = nn.Parameter(torch.zeros(1, self.out_channels, self.nlat_local, self.nlon_local))
-            self.bias.is_shared_mp = ["matmul"]
-            self.bias.sharded_dims_mp = [None, None, "h", "w"]
+            self.bias.is_shared_mp = ["model"]
+            self.bias.sharded_dims_mp = [None, None, None, None]
 
     def forward(self, x):
         dtype = x.dtype
         residual = x
         x = x.float()
-        B, C, H, W = x.shape
 
-        with amp.autocast(enabled=False):
+        with amp.autocast(device_type="cuda", enabled=False):
             x = self.forward_transform(x).contiguous()
             if self.scale_residual:
                 residual = self.inverse_transform(x)
                 residual = residual.to(dtype)
 
-        # approach with unpadded weights
+        B, C, H, W = x.shape
+        x = x.reshape(B, self.num_groups, C // self.num_groups, H, W)
         xp = self._contract(x, self.weight, separable=self.separable, operator_type=self.operator_type)
-        x = xp.contiguous()
+        x = xp.reshape(B, self.out_channels, H, W).contiguous()
 
-        with amp.autocast(enabled=False):
+        with amp.autocast(device_type="cuda", enabled=False):
             x = self.inverse_transform(x)
 
         if hasattr(self, "bias"):
             x = x + self.bias
 
         x = x.to(dtype=dtype)
-
-        return x, residual
-
-
-class FactorizedSpectralConv(nn.Module):
-    """
-    Factorized version of SpectralConv. Uses tensorly-torch to keep the weights factorized
-    """
-
-    def __init__(
-        self,
-        forward_transform,
-        inverse_transform,
-        in_channels,
-        out_channels,
-        operator_type="diagonal",
-        rank=0.2,
-        factorization=None,
-        separable=False,
-        decomposition_kwargs=dict(),
-        bias=False,
-        gain=1.0,
-    ):
-        super(FactorizedSpectralConv, self).__init__()
-
-        self.forward_transform = forward_transform
-        self.inverse_transform = inverse_transform
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.modes_lat = self.inverse_transform.lmax
-        self.modes_lon = self.inverse_transform.mmax
-
-        self.scale_residual = (self.forward_transform.nlat != self.inverse_transform.nlat) or (self.forward_transform.nlon != self.inverse_transform.nlon)
-        if hasattr(self.forward_transform, "grid"):
-            self.scale_residual = self.scale_residual or (self.forward_transform.grid != self.inverse_transform.grid)
-
-        # Make sure we are using a Complex Factorized Tensor
-        if factorization is None:
-            factorization = "ComplexDense"  # No factorization
-        complex_weight = factorization[:7].lower() == "complex"
-
-        # remember factorization details
-        self.operator_type = operator_type
-        self.rank = rank
-        self.factorization = factorization
-        self.separable = separable
-
-        assert self.inverse_transform.lmax == self.modes_lat
-        assert self.inverse_transform.mmax == self.modes_lon
-
-        weight_shape = [in_channels]
-
-        if not self.separable:
-            weight_shape += [out_channels]
-
-        if isinstance(self.inverse_transform, thd.DistributedInverseRealSHT):
-            self.modes_lat_local = self.inverse_transform.l_shapes[comm.get_rank("h")]
-            self.modes_lon_local = self.inverse_transform.m_shapes[comm.get_rank("w")]
-        else:
-            self.modes_lat_local = self.modes_lat
-            self.modes_lon_local = self.modes_lon
-
-        # unpadded weights
-        if self.operator_type == "diagonal":
-            weight_shape += [self.modes_lat_local, self.modes_lon_local]
-        elif self.operator_type == "dhconv":
-            weight_shape += [self.modes_lat_local]
-        elif self.operator_type == "rank":
-            weight_shape += [self.rank]
-        else:
-            raise ValueError(f"Unsupported operator type f{self.operator_type}")
-
-        # form weight tensors
-        self.weight = FactorizedTensor.new(weight_shape, rank=self.rank, factorization=factorization, fixed_rank_modes=False, **decomposition_kwargs)
-        # initialization of weights
-        scale = math.sqrt(gain / float(weight_shape[0]))
-        self.weight.normal_(mean=0.0, std=scale)
-
-        # get the contraction handle
-        if operator_type == "rank":
-            self._contract = _contract_rank
-        else:
-            self._contract = get_contract_fun(self.weight, implementation="reconstructed", separable=separable, complex=complex_weight, operator_type=operator_type)
-
-        if bias == "constant":
-            self.bias = nn.Parameter(torch.zeros(1, self.out_channels, 1, 1))
-        elif bias == "position":
-            self.bias = nn.Parameter(torch.zeros(1, self.out_channels, self.nlat_local, self.nlon_local))
-            self.bias.is_shared_mp = ["matmul"]
-            self.bias.sharded_dims_mp = [None, None, "h", "w"]
-
-    def forward(self, x):
-        dtype = x.dtype
-        residual = x
-        x = x.float()
-
-        with amp.autocast(enabled=False):
-            x = self.forward_transform(x).contiguous()
-            if self.scale_residual:
-                residual = self.inverse_transform(x)
-                residual = residual.to(dtype)
-
-        if self.operator_type == "rank":
-            xp = self._contract(x, self.weight, self.lat_weight, self.lon_weight)
-        else:
-            xp = self._contract(x, self.weight, separable=self.separable, operator_type=self.operator_type)
-        x = xp.contiguous()
-
-        with amp.autocast(enabled=False):
-            x = self.inverse_transform(x)
-
-        if hasattr(self, "bias"):
-            x = x + self.bias
-
-        x = x.type(dtype)
 
         return x, residual
 
@@ -284,7 +160,7 @@ class SpectralAttention(nn.Module):
         drop_rate=0.0,
         gain=1.0,
     ):
-        super(SpectralAttention, self).__init__()
+        super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -386,7 +262,7 @@ class SpectralAttention(nn.Module):
         x = x.to(torch.float32)
 
         # FWD transform
-        with amp.autocast(enabled=False):
+        with amp.autocast(device_type="cuda", enabled=False):
             x = self.forward_transform(x)
             if self.scale_residual:
                 residual = self.inverse_transform(x)
@@ -396,7 +272,7 @@ class SpectralAttention(nn.Module):
         x = self.forward_mlp(x)
 
         # BWD transform
-        with amp.autocast(enabled=False):
+        with amp.autocast(device_type="cuda", enabled=False):
             x = self.inverse_transform(x)
 
         # cast back to initial precision

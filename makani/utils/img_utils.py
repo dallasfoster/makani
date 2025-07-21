@@ -48,7 +48,7 @@ class PeriodicPad2d(nn.Module):
         return out
 
 
-def reshape_fields(img, inp_or_tar, crop_size_x, crop_size_y, rnd_x, rnd_y, params, y_roll, train, normalize=True):
+def reshape_fields(img, inp_or_tar, crop_size_x, crop_size_y, rnd_x, rnd_y, params, train, normalize=True):
     # Takes in np array of size (n_history+1, c, h, w) and returns torch tensor of size ((n_channels*(n_history+1), crop_size_x, crop_size_y)
 
     if len(np.shape(img)) == 3:
@@ -77,15 +77,16 @@ def reshape_fields(img, inp_or_tar, crop_size_x, crop_size_y, rnd_x, rnd_y, para
             img -= means
             img /= stds
 
-    if params.add_grid:
+    if params.get("add_grid", False):
         if inp_or_tar == "inp":
-            if params.gridtype == "linear":
+            gridtype = params.get("gridtype", "sinusoidal")
+            if gridtype == "linear":
                 assert params.n_grid_channels == 2, "n_grid_channels must be set to 2 for gridtype linear"
                 x = np.meshgrid(np.linspace(-1, 1, img_shape_x))
                 y = np.meshgrid(np.linspace(-1, 1, img_shape_y))
                 grid_x, grid_y = np.meshgrid(y, x)
                 grid = np.stack((grid_x, grid_y), axis=0)
-            elif params.gridtype == "sinusoidal":
+            elif gridtype == "sinusoidal":
                 assert params.n_grid_channels == 4, "n_grid_channels must be set to 4 for gridtype sinusoidal"
                 x1 = np.meshgrid(np.sin(np.linspace(0, 2 * np.pi, img_shape_x)))
                 x2 = np.meshgrid(np.cos(np.linspace(0, 2 * np.pi, img_shape_x)))
@@ -95,9 +96,6 @@ def reshape_fields(img, inp_or_tar, crop_size_x, crop_size_y, rnd_x, rnd_y, para
                 grid_x2, grid_y2 = np.meshgrid(y2, x2)
                 grid = np.expand_dims(np.stack((grid_x1, grid_y1, grid_x2, grid_y2), axis=0), axis=0)
             img = np.concatenate((img, grid), axis=1)
-
-    if params.roll:
-        img = np.roll(img, y_roll, axis=-1)
 
     if train and (crop_size_x or crop_size_y):
         img = img[:, :, rnd_x : rnd_x + crop_size_x, rnd_y : rnd_y + crop_size_y]

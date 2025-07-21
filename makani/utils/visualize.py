@@ -15,10 +15,11 @@
 
 import os
 import io
+import multiprocessing as mp
 import numpy as np
 import concurrent.futures as cf
 from PIL import Image
-from moviepy.video.io import ImageSequenceClip
+from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 import wandb
 
 import torch
@@ -68,7 +69,7 @@ def plot_comparison(
 
     ax = fig.add_subplot(2, 1, 1, projection=projection)  # can also be Mollweide
 
-    ax.pcolormesh(Lon, Lat, pred, cmap=cmap, vmax=vmax, vmin=vmin)
+    ax.pcolormesh(Lon, Lat, pred, cmap=cmap)
     ax.set_title(pred_title)
     ax.grid(True)
     ax.set_xticklabels([])
@@ -76,7 +77,7 @@ def plot_comparison(
 
     ax = fig.add_subplot(2, 1, 2, projection=projection)  # can also be Mollweide
 
-    ax.pcolormesh(Lon, Lat, truth, cmap=cmap, vmax=vmax, vmin=vmin)
+    ax.pcolormesh(Lon, Lat, truth, cmap=cmap)
     ax.set_title(truth_title)
     ax.grid(True)
     ax.set_xticklabels([])
@@ -96,40 +97,39 @@ def plot_comparison(
     return image
 
 
-def plot_rollout_metrics(acc_curves, rmse_curves, params, epoch, model_name, comparison_channels=["u10m", "v10m", "z500", "t2m", "t850"]):
+def plot_rollout_metrics(metric_curves, var_names, score_path=None, file_prefix="curve", dtxdh=6):
     "Plots rollout metrics such as RMSE and ACC and saves them to the experiment directory"
 
-    channel_names = params.channel_names
+    for ivar, var_name in enumerate(var_names):
 
-    for metric in ["acc", "rmse"]:
-        curves = acc_curves if metric == "acc" else rmse_curves
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
 
-        for comparison_var in comparison_channels:
-            model_metric = curves[channel_names.index(comparison_var), :].cpu().numpy()
+        metric_curve = metric_curves[ivar]
 
-            import matplotlib.pyplot as plt
-            import matplotlib.ticker as ticker
+        # prepare the plot
+        fig, ax = plt.subplots()
 
-            var_name = comparison_var
+        # get the time sclaling for the time axis
+        t = np.arange(1, len(metric_curve) + 1, 1) * dtxdh
+        ax.plot(t, metric_curve, ".-")
+        xticks = np.arange(0, len(metric_curve) + 1, 1) * dtxdh
+        x_locator = ticker.FixedLocator(xticks)
+        ax.xaxis.set_major_locator(x_locator)
+        y_locator = ticker.MaxNLocator(nbins=20)
+        ax.yaxis.set_major_locator(y_locator)
+        ax.grid(which="major", alpha=0.5)
+        ax.legend()
+        ax.set_xlabel("Time [h]")
+        ax.set_ylabel(file_prefix + " " + var_name)
+        plt.setp(ax.get_xticklabels(), rotation=45, horizontalalignment="right")
 
-            fig, ax = plt.subplots()
-            t = np.arange(1, len(model_metric) + 1, 1) * 6
-            ax.plot(t, model_metric, ".-", label=model_name)
-            xticks = np.arange(0, len(model_metric) + 1, 1) * 6
-            x_locator = ticker.FixedLocator(xticks)
-            ax.xaxis.set_major_locator(x_locator)
-            y_locator = ticker.MaxNLocator(nbins=20)
-            ax.yaxis.set_major_locator(y_locator)
-            ax.grid(which="major", alpha=0.5)
-            ax.legend()
-            ax.set_xlabel("Time [h]")
-            ax.set_ylabel(metric + " " + var_name)
-            ax.set_title(params.wandb_name)
-            plt.setp(ax.get_xticklabels(), rotation=45, horizontalalignment="right")
-            fig.savefig(os.path.join(params.experiment_dir, metric + "_" + var_name + ".png"))
-            # push to wandb
-            if params.log_to_wandb:
-                wandb.log({metric + "_" + var_name: wandb.Image(fig)}, step=epoch)
+        # write out the plot
+        if score_path is not None:
+            fig.savefig(os.path.join(score_path, file_prefix + "_" + var_name + ".png"))
+        # # push to wandb
+        # if params.log_to_wandb:
+        #     wandb.log({metric + "_" + var_name: wandb.Image(fig)}, step=epoch)
 
 
 def visualize_field(tag, func_string, prediction, target, lat, lon, scale, bias, diverging):
@@ -173,7 +173,8 @@ class VisualizationWrapper(object):
         self.bias = bias
 
         # this is for parallel processing
-        self.executor = cf.ProcessPoolExecutor(max_workers=num_workers)
+        ctx = mp.get_context("spawn")
+        self.executor = cf.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx)
         self.requests = []
 
     def reset(self):
@@ -225,7 +226,7 @@ class VisualizationWrapper(object):
             results = [wandb.Image(image, caption=prefix) for prefix, image in results.items()]
 
         if self.log_to_wandb and results:
-            wandb.log({"Inference samples": results})
+            wandb.log({"Inference samples": results}, commit=False)
 
         # reset requests
         self.reset()

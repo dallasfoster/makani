@@ -18,14 +18,18 @@ import torch.nn as nn
 
 from makani.models.preprocessor import Preprocessor2D
 
+
 class SingleStepWrapper(nn.Module):
     def __init__(self, params, model_handle):
-        super(SingleStepWrapper, self).__init__()
+        super().__init__()
         self.preprocessor = Preprocessor2D(params)
         self.model = model_handle()
 
-    def forward(self, inp):
-        # first append unpredicted features
+    def forward(self, inp, replace_state=True):
+        # update internal state
+        self.preprocessor.update_internal_state(replace_state=replace_state)
+
+        # append unpredicted features
         inpa = self.preprocessor.append_unpredicted_features(inp)
 
         # now normalize
@@ -38,6 +42,9 @@ class SingleStepWrapper(nn.Module):
         # forward pass
         yn = self.model(inpans)
 
+        # perform bias correction if requested
+        yn = self.preprocessor.correct_bias(yn)
+
         # undo normalization
         y = self.preprocessor.history_denormalize(yn, target=True)
 
@@ -49,10 +56,11 @@ class SingleStepWrapper(nn.Module):
 
 class MultiStepWrapper(nn.Module):
     def __init__(self, params, model_handle):
-        super(MultiStepWrapper, self).__init__()
+        super().__init__()
         self.preprocessor = Preprocessor2D(params)
         self.model = model_handle()
         self.residual_mode = True if (params.target == "target") else False
+        self.push_forward_mode = params.get("multistep_push_forward", False)
 
         # collect parameters for history
         self.n_future = params.n_future
@@ -60,7 +68,17 @@ class MultiStepWrapper(nn.Module):
     def _forward_train(self, inp):
         result = []
         inpt = inp
+
+        # initialize fresh buffer
+        self.preprocessor.update_internal_state(replace_state=True)
+
+        # do the rollout
         for step in range(self.n_future + 1):
+
+            # in push-forward mode, we need to detach the tensor:
+            if self.push_forward_mode:
+                inpt = inpt.detach()
+
             # add unpredicted features
             inpa = self.preprocessor.append_unpredicted_features(inpt)
 
@@ -73,6 +91,9 @@ class MultiStepWrapper(nn.Module):
 
             # prediction
             predn = self.model(inpans)
+
+            # perform bias correction if requested
+            predn = self.preprocessor.correct_bias(predn)
 
             # append the denormalized result to output list
             # important to do that here, otherwise normalization stats
@@ -88,6 +109,9 @@ class MultiStepWrapper(nn.Module):
             if step == self.n_future:
                 break
 
+            # update internal buffer
+            self.preprocessor.update_internal_state(replace_state=False)
+
             # append history
             inpt = self.preprocessor.append_history(inpt, pred, step)
 
@@ -97,6 +121,9 @@ class MultiStepWrapper(nn.Module):
         return result
 
     def _forward_eval(self, inp):
+        # update internal state
+        self.preprocessor.update_internal_state(replace_state=True)
+
         # first append unpredicted features
         inpa = self.preprocessor.append_unpredicted_features(inp)
 
@@ -110,6 +137,9 @@ class MultiStepWrapper(nn.Module):
         # important, remove normalization here,
         # because otherwise normalization stats are already outdated
         yn = self.model(inpans)
+
+        # perform bias correction if requested
+        yn = self.preprocessor.correct_bias(yn)
 
         # important, remove normalization here,
         # because otherwise normalization stats are already outdated

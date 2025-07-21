@@ -15,5 +15,6 @@
 
 from .preprocessor import Preprocessor2D
 from .stepper import SingleStepWrapper, MultiStepWrapper
+from .stochastic_interpolant import StochasticInterpolantWrapper
 
 import makani.models.model_registry

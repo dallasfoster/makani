@@ -25,10 +25,13 @@ import logging
 from typing import List, Union
 from functools import partial
 
+import torch
 import torch.nn as nn
 
 from makani.utils.YParams import ParamsBase
 from makani.models import SingleStepWrapper, MultiStepWrapper
+from makani.models import StochasticInterpolantWrapper
+from makani.utils.dataloaders.data_helpers import get_data_normalization
 
 
 def _construct_registry() -> dict:
@@ -103,6 +106,7 @@ def register_model(model: Union[str, nn.Module], name: Union[str, None] = None) 
     else:
         _register_from_module(model, name)
 
+
 def list_models() -> List[str]:
     """
     Returns a list of the names of all models currently registered in the registry.
@@ -116,7 +120,7 @@ def list_models() -> List[str]:
     return list(_model_registry.keys())
 
 
-def get_model(params: ParamsBase, **kwargs) -> "torch.nn.Module":
+def get_model(params: ParamsBase, use_stochastic_interpolation: bool = False, multistep: bool = False, **kwargs) -> "torch.nn.Module":
     """
     Convenience routine that constructs the model passing parameters and kwargs.
     Unloads all the parameters in the params datastructure as a dict.
@@ -137,6 +141,10 @@ def get_model(params: ParamsBase, **kwargs) -> "torch.nn.Module":
         If no model is registered under the provided name.
     """
 
+    # conditional import for constraints
+    if hasattr(params, "constraints"):
+        from makani.models.parametrizations import ConstraintsWrapper
+
     if params is not None:
         # makani requires that these entries are set in params for now
         inp_shape = (params.img_crop_shape_x, params.img_crop_shape_y)
@@ -144,10 +152,15 @@ def get_model(params: ParamsBase, **kwargs) -> "torch.nn.Module":
         inp_chans = params.N_in_channels
         out_chans = params.N_out_channels
 
+        if hasattr(params, "constraints"):
+            cwrap = ConstraintsWrapper(constraints=params.constraints, channel_names=params.channel_names, bias=None, scale=None, model_handle=None)
+            out_chans = cwrap.N_in_channels
+
+    # in the case that the model is not found in the model registry, we try to register it, given that it is a valid filepath:entrypoint
     if params.nettype not in _model_registry:
         logging.warning(f"Net type {params.nettype} does not exist in the registry. Trying to register it.")
         register_model(params.nettype, params.nettype)
-        
+
     model_handle = _model_registry.get(params.nettype)
     if model_handle is not None:
         if isinstance(model_handle, (EntryPoint, importlib_metadata.EntryPoint)):
@@ -157,11 +170,25 @@ def get_model(params: ParamsBase, **kwargs) -> "torch.nn.Module":
     else:
         raise KeyError(f"No model is registered under the name {name}")
 
-    # wrap into Multi-Step if requested
-    if params.n_future > 0:
-        model = MultiStepWrapper(params, model_handle)
+    # use the constraint wrapper
+    if hasattr(params, "constraints"):
+        # we need this in order to unormalize the data:
+        # scale and bias
+        bias, scale = get_data_normalization(params)
+        bias = torch.from_numpy(bias)[:, params.out_channels, ...].to(torch.float32)
+        scale = torch.from_numpy(scale)[:, params.out_channels, ...].to(torch.float32)
+
+        # create a new wrapper handle
+        model_handle = partial(ConstraintsWrapper, constraints=params.constraints, channel_names=params.channel_names, bias=bias, scale=scale, model_handle=model_handle)
+
+    if not use_stochastic_interpolation:
+        # wrap into Multi-Step if requested
+        if multistep:
+            model = MultiStepWrapper(params, model_handle)
+        else:
+            model = SingleStepWrapper(params, model_handle)
     else:
-        model = SingleStepWrapper(params, model_handle)
+        model = StochasticInterpolantWrapper(params, model_handle, noise_epsilon=params.get("noise_epsilon", 1.0), use_foellmer=params.get("use_foellmer", False))
 
     return model
 

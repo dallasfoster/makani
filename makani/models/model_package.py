@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Model package for easy inference/packaging. Model packages contain all the necessary data to 
+Model package for easy inference/packaging. Model packages contain all the necessary data to
 perform inference and its interface is compatible with earth2mip
 """
 import os
@@ -24,13 +24,29 @@ import jsbeautifier
 import numpy as np
 import torch
 from makani.utils.YParams import ParamsBase
+from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle import cos_zenith_angle
+from makani.utils.dataloaders.data_helpers import get_data_normalization
 
 from makani.models import model_registry
 
 import datetime
 
 import logging
+
+
+logger = logging.getLogger(__name__)
+
+# These define the model package in terms of where makani expects the files to be located
+THIS_MODULE = "makani.models.model_package"
+MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
+MINS_FILE = "mins.npy"
+MAXS_FILE = "maxs.npy"
+MEANS_FILE = "global_means.npy"
+STDS_FILE = "global_stds.npy"
+OROGRAPHY_FILE = "orography.nc"
+LANDMASK_FILE = "land_mask.nc"
+SOILTYPE_FILE = "soil_type.nc"
 
 
 class LocalPackage:
@@ -44,15 +60,24 @@ class LocalPackage:
     def get(self, path):
         return os.path.join(self.root, path)
 
+    @staticmethod
+    def _load_static_data(root, params):
+        if params.get("add_orography", False):
+            params.orography_path = os.path.join(root, OROGRAPHY_FILE)
+        if params.get("add_landmask", False):
+            params.landmask_path = os.path.join(root, LANDMASK_FILE)
+        if params.get("add_soiltype", False):
+            params.soiltype_path = os.path.join(root, SOILTYPE_FILE)
 
-logger = logging.getLogger(__name__)
-
-THIS_MODULE = "makani.models.model_package"
-MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
-MINS_FILE = "mins.npy"
-MAXS_FILE = "maxs.npy"
-MEANS_FILE = "global_means.npy"
-STDS_FILE = "global_stds.npy"
+        # alweays load all normalization files
+        if params.get("global_means_path", None) is not None:
+            params.global_means_path = os.path.join(root, MEANS_FILE)
+        if params.get("global_stds_path", None) is not None:
+            params.global_stds_path = os.path.join(root, STDS_FILE)
+        if params.get("min_path", None) is not None:
+            params.min_path = os.path.join(root, MINS_FILE)
+        if params.get("max_path", None) is not None:
+            params.max_path = os.path.join(root, MAXS_FILE)
 
 
 class ModelWrapper(torch.nn.Module):
@@ -79,21 +104,67 @@ class ModelWrapper(torch.nn.Module):
         nlat = params.img_shape_x
         nlon = params.img_shape_y
 
-        self.lats = 90 - 180 * np.arange(nlat) / (nlat - 1)
-        self.lons = 360 * np.arange(nlon) / nlon
-        self.add_zenith = params.add_zenith
+        # configure lats
+        if "lat" in self.params:
+            self.lats = np.asarray(self.params.lat)
+        else:
+            self.lats = np.linspace(90, -90, nlat, endpoint=True)
 
-    def forward(self, x, time):
+        # configure lons
+        if "lon" in self.params:
+            self.lons =	np.asarray(self.params.lon)
+        else:
+            self.lons = np.linspace(0, 360, nlon, endpoint=False)
+
+        # zenith angle
+        self.add_zenith = params.get("add_zenith", False)
         if self.add_zenith:
-            lon_grid, lat_grid = np.meshgrid(self.lons, self.lats)
-            cosz = cos_zenith_angle(time, lon_grid, lat_grid)
+            self.lon_grid, self.lat_grid = np.meshgrid(self.lons, self.lats)
+
+        # load the normalization files
+        bias, scale = get_data_normalization(self.params)
+
+        # convert them to torch
+        in_bias = torch.as_tensor(bias[:, self.params.in_channels]).to(torch.float32)
+        in_scale = torch.as_tensor(scale[:, self.params.in_channels]).to(torch.float32)
+        out_bias = torch.as_tensor(bias[:, self.params.out_channels]).to(torch.float32)
+        out_scale = torch.as_tensor(scale[:, self.params.out_channels]).to(torch.float32)
+
+        self.register_buffer("in_bias", in_bias)
+        self.register_buffer("in_scale", in_scale)
+        self.register_buffer("out_bias", out_bias)
+        self.register_buffer("out_scale", out_scale)
+
+    @property
+    def in_channels(self):
+        return self.params.get("channel_names", None)
+
+    @property
+    def out_channels(self):
+        return self.params.get("channel_names", None)
+
+    @property
+    def timestep(self):
+        return self.params.dt * self.params.dhours
+
+    def forward(self, x, time, normalized_data=True, replace_state=None):
+        if not normalized_data:
+            x = (x - self.in_bias) / self.in_scale
+
+        if self.add_zenith:
+            cosz = cos_zenith_angle(time, self.lon_grid, self.lat_grid)
             cosz = cosz.astype(np.float32)
-            z = torch.from_numpy(cosz).to(device=x.device)
+            z = torch.as_tensor(cosz).to(device=x.device)
             while z.ndim != x.ndim:
                 z = z[None]
-            x = torch.cat([x, z], dim=1)
+            self.model.preprocessor.cache_unpredicted_features(None, None, xz=z, yz=None)
 
-        return self.model(x)
+        out = self.model(x, replace_state=replace_state)
+
+        if not normalized_data:
+            out = out * self.out_scale + self.out_bias
+
+        return out
 
 
 def save_model_package(params):
@@ -110,23 +181,24 @@ def save_model_package(params):
         msg = jsbeautifier.beautify(json.dumps(params.to_dict()), jsopts)
         f.write(msg)
 
-    if hasattr(params, "add_orography") and params.add_orography:
+    if params.get("add_orography", False):
         shutil.copy(params.orography_path, os.path.join(params.experiment_dir, "orography.nc"))
 
-    if hasattr(params, "add_landmask") and params.add_landmask:
+    if params.get("add_landmask", False):
         shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, "land_mask.nc"))
 
-    # a bit hacky - we should change this to get the normalization from the dataloader.
-    if hasattr(params, "global_means_path") and params.global_means_path is not None:
-        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, MEANS_FILE))
-    if hasattr(params, "global_stds_path") and params.global_stds_path is not None:
-        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, STDS_FILE))
+    if params.get("add_soiltype", False):
+        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, "soil_type.nc"))
 
-    if params.normalization == "minmax":
-        if hasattr(params, "min_path") and params.min_path is not None:
-            shutil.copy(params.min_path, os.path.join(params.experiment_dir, MINS_FILE))
-        if hasattr(params, "max_path") and params.max_path is not None:
-            shutil.copy(params.max_path, os.path.join(params.experiment_dir, MAXS_FILE))
+    # always save out all normalization files
+    if params.get("global_means_path", None) is not None:
+        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, MEANS_FILE))
+    if params.get("global_stds_path", None) is not None:
+        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, STDS_FILE))
+    if params.get("min_path", None) is not None:
+        shutil.copy(params.min_path, os.path.join(params.experiment_dir, MINS_FILE))
+    if params.get("max_path", None) is not None:
+        shutil.copy(params.max_path, os.path.join(params.experiment_dir, MAXS_FILE))
 
     # write out earth2mip metadata.json
     fcn_mip_data = {
@@ -137,36 +209,14 @@ def save_model_package(params):
         f.write(msg)
 
 
-def _load_static_data(package, params):
-    if hasattr(params, "add_orography") and params.add_orography:
-        params.orography_path = package.get("orography.nc")
-
-    if hasattr(params, "add_landmask") and params.add_landmask:
-        params.landmask_path = package.get("land_mask.nc")
-
-    # a bit hacky - we should change this to correctly
-    if params.normalization == "zscore":
-        if hasattr(params, "global_means_path") and params.global_means_path is not None:
-            params.global_means_path = package.get(MEANS_FILE)
-        if hasattr(params, "global_stds_path") and params.global_stds_path is not None:
-            params.global_stds_path = package.get(STDS_FILE)
-    elif params.normalization == "minmax":
-        if hasattr(params, "min_path") and params.min_path is not None:
-            params.min_path = package.get(MINS_FILE)
-        if hasattr(params, "max_path") and params.max_path is not None:
-            params.max_path = package.get(MAXS_FILE)
-    else:
-        raise ValueError("Unknown normalization mode.")
-
-
-def load_model_package(package, pretrained=True, device="cpu"):
+# TODO: this is not clean and should be reworked to allow restoring from params + checkpoint file
+def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     """
     Loads model package and return the wrapper which can be used for inference.
     """
     path = package.get("config.json")
     params = ParamsBase.from_json(path)
-    logger.info(str(params.to_dict()))
-    _load_static_data(package, params)
+    LocalPackage._load_static_data(package.root, params)
 
     # assume we are not distributed
     # distributed checkpoints might be saved with different params values
@@ -176,21 +226,15 @@ def load_model_package(package, pretrained=True, device="cpu"):
     params.img_local_shape_y = params.img_shape_y
 
     # get the model and
-    model = model_registry.get_model(params).to(device)
+    model = model_registry.get_model(params, multistep=multistep).to(device)
 
     if pretrained:
         best_checkpoint_path = package.get(MODEL_PACKAGE_CHECKPOINT_PATH)
-        # critical that this map_location be cpu, rather than the device to
-        # avoid out of memory errors.
-        checkpoint = torch.load(best_checkpoint_path, map_location=device)
-        state_dict = checkpoint["model_state"]
-        torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(state_dict, "module.")
-        model.load_state_dict(state_dict, strict=True)
+        Driver.restore_from_checkpoint(best_checkpoint_path, model)
 
     model = ModelWrapper(model, params=params)
 
     # by default we want to do evaluation so setting it to eval here
-    # 1-channel difference in training/eval mode
     model.eval()
 
     return model
@@ -209,6 +253,7 @@ def load_time_loop(package, device=None, time_step_hours=None):
 
     from earth2mip.networks import Inference
     from earth2mip.grid import equiangular_lat_lon_grid
+    from physicsnemo.distributed.manager import DistributedManager
 
     config = package.get("config.json")
     params = ParamsBase.from_json(config)
@@ -216,36 +261,19 @@ def load_time_loop(package, device=None, time_step_hours=None):
     if params.in_channels != params.out_channels:
         raise NotImplementedError("Non-equal input and output channels are not implemented yet.")
 
-    names = [params.channel_names[i] for i in params.in_channels]
+    names = [params.data_channel_names[i] for i in params.in_channels]
+    params.min_path = package.get(MINS_FILE)
+    params.max_path = package.get(MAXS_FILE)
+    params.global_means_path = package.get(MEANS_FILE)
+    params.global_stds_path = package.get(STDS_FILE)
 
-    if params.normalization == "minmax":
-        min_path = package.get(MINS_FILE)
-        max_path = package.get(MAXS_FILE)
-
-        a = np.load(min_path)
-        a = np.squeeze(a)[params.in_channels]
-
-        b = np.load(max_path)
-        b = np.squeeze(b)[params.in_channels]
-
-        # work around to implement minmax scaling based with the earth2mip
-        # Inference class below
-        center = (a + b) / 2
-        scale = (b - a) / 2
-    else:
-        center_path = package.get(MEANS_FILE)
-        scale_path = package.get(STDS_FILE)
-
-        center = np.load(center_path)
-        center = np.squeeze(center)[params.in_channels]
-
-        scale = np.load(scale_path)
-        scale = np.squeeze(scale)[params.in_channels]
+    center, scale = get_data_normalization(params)
 
     model = load_model_package(package, pretrained=True, device=device)
-    shape = (params.img_shape_x, params.img_shape_y)
+    shape = (params.img_crop_shape_x, params.img_crop_shape_y)
 
-    grid = equiangular_lat_lon_grid(nlat=params.img_shape_x, nlon=params.img_shape_y, includes_south_pole=True)
+    # TODO: insert a check to see if the grid e2mip computes is the same that makani uses
+    grid = equiangular_lat_lon_grid(nlat=params.img_crop_shape_x, nlon=params.img_crop_shape_y, includes_south_pole=True)
 
     if time_step_hours is None:
         hour = datetime.timedelta(hours=1)
@@ -258,8 +286,8 @@ def load_time_loop(package, device=None, time_step_hours=None):
     inference = Inference(
         model=model,
         channel_names=names,
-        center=center,
-        scale=scale,
+        center=center[:, params.in_channels],
+        scale=scale[:, params.out_channels],
         grid=grid,
         n_history=params.n_history,
         time_step=time_step,
