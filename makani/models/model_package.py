@@ -180,23 +180,23 @@ def save_model_package(params):
         f.write(msg)
 
     if params.get("add_orography", False):
-        shutil.copy(params.orography_path, os.path.join(params.experiment_dir, "orography.nc"))
+        shutil.copy(params.orography_path, os.path.join(params.experiment_dir, os.path.basename(params.orography_path)))
 
     if params.get("add_landmask", False):
-        shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, "land_mask.nc"))
+        shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, os.path.basename(params.landmask_path)))
 
     if params.get("add_soiltype", False):
-        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, "soil_type.nc"))
+        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, os.path.basename(params.soiltype_path)))
 
     # always save out all normalization files
     if params.get("global_means_path", None) is not None:
-        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, MEANS_FILE))
+        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, os.path.basename(params.global_means_path)))
     if params.get("global_stds_path", None) is not None:
-        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, STDS_FILE))
+        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, os.path.basename(params.global_stds_path)))
     if params.get("min_path", None) is not None:
-        shutil.copy(params.min_path, os.path.join(params.experiment_dir, MINS_FILE))
+        shutil.copy(params.min_path, os.path.join(params.experiment_dir, os.path.basename(params.min_path)))
     if params.get("max_path", None) is not None:
-        shutil.copy(params.max_path, os.path.join(params.experiment_dir, MAXS_FILE))
+        shutil.copy(params.max_path, os.path.join(params.experiment_dir, os.path.basename(params.max_path)))
 
     # write out earth2mip metadata.json
     fcn_mip_data = {
@@ -227,7 +227,7 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     model = model_registry.get_model(params, multistep=multistep).to(device)
 
     if pretrained:
-        best_checkpoint_path = package.get(MODEL_PACKAGE_CHECKPOINT_PATH)
+        best_checkpoint_path = package.get(LocalPackage.MODEL_PACKAGE_CHECKPOINT_PATH)
         Driver.restore_from_checkpoint(best_checkpoint_path, model)
 
     model = ModelWrapper(model, params=params)
@@ -260,10 +260,10 @@ def load_time_loop(package, device=None, time_step_hours=None):
         raise NotImplementedError("Non-equal input and output channels are not implemented yet.")
 
     names = [params.data_channel_names[i] for i in params.in_channels]
-    params.min_path = package.get(MINS_FILE)
-    params.max_path = package.get(MAXS_FILE)
-    params.global_means_path = package.get(MEANS_FILE)
-    params.global_stds_path = package.get(STDS_FILE)
+    params.min_path = package.get(LocalPackage.MINS_FILE)
+    params.max_path = package.get(LocalPackage.MAXS_FILE)
+    params.global_means_path = package.get(LocalPackage.MEANS_FILE)
+    params.global_stds_path = package.get(LocalPackage.STDS_FILE)
 
     center, scale = get_data_normalization(params)
 
