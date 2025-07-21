@@ -200,7 +200,7 @@ def save_model_package(params):
 
     # write out earth2mip metadata.json
     fcn_mip_data = {
-        "entrypoint": {"name": f"{THIS_MODULE}:load_time_loop"},
+        "entrypoint": {"name": f"{LocalPackage.THIS_MODULE}:load_time_loop"},
     }
     with open(os.path.join(params.experiment_dir, "metadata.json"), "w") as f:
         msg = jsbeautifier.beautify(json.dumps(fcn_mip_data), jsopts)
