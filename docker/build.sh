@@ -16,14 +16,15 @@
 # limitations under the License.
 
 # which version to take:
-dlfw_version=24.10
+dlfw_version=25.05
 
 # gitlab credentials
+gitlab_repo=makani
 gitlab_tag=latest
 
 cd ../
 
 # build and push
-docker build --network host -t modulus-makani:${gitlab_tag} \
+docker build --network host -t makani:${gitlab_tag}-${dlfw_version} \
        --build-arg DLFW_VERSION=${dlfw_version} \
        -f docker/Dockerfile .

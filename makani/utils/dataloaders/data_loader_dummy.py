@@ -14,57 +14,81 @@
 # limitations under the License.
 
 import logging
+from typing import Optional, List, Tuple
 import glob
 import torch
 import random
 import numpy as np
 import h5py
-from torch import Tensor
+import torch
 import math
 
 # distributed stuff
 from makani.utils import comm
 
 # we need this
-from modulus.distributed.utils import compute_split_shapes
+from physicsnemo.distributed.utils import compute_split_shapes
 
 # for grid conversion
 from makani.utils.grids import GridConverter
 
 
 class DummyLoader(object):
-    def __init__(self, params, location, train, device):
-        self.params = params
+    def __init__(self,
+                 location: str,
+                 batch_size: int,
+                 dt: int,
+                 dhours: int,
+                 in_channels: List[int],
+                 out_channels: List[int],
+                 img_shape: Optional[Tuple[int,int]]=None,
+                 max_samples: Optional[int]=None,
+                 n_samples_per_epoch: Optional[int]=None,
+                 n_history: Optional[int]=0,
+                 n_future: Optional[int]=0,
+                 add_zenith: Optional[bool]=False,
+                 latitudes: Optional[np.array]=None,
+                 longitudes: Optional[np.array]=None,
+                 data_grid_type: Optional[str]="equiangular",
+                 model_grid_type: Optional[str]="equiangular",
+                 return_timestamp: Optional[bool]=False,
+                 return_target: Optional[bool]=True,
+                 dataset_path: Optional[str]="fields",
+                 crop_size: Optional[Tuple[int, int]]=(None, None),
+                 crop_anchor: Optional[Tuple[int, int]]=(0, 0),
+                 io_grid: Optional[List[int]]=[1, 1, 1],
+                 io_rank: Optional[List[int]]=[0, 0, 0],
+                 device: Optional[torch.device]=torch.device("cpu"),
+                 enable_logging: Optional[bool]=True,
+                 **kwargs
+    ):
+        
         self.location = location
-        self.train = train
-        self.dt = params.dt
-        self.dhours = params.dhours
-        self.batch_size = int(params.batch_size)
-        self.n_history = params.n_history
-        self.n_future = params.n_future if train else params.valid_autoreg_steps
-        self.in_channels = params.in_channels
-        self.out_channels = params.out_channels
-        self.n_in_channels = len(self.in_channels)
-        self.n_out_channels = len(self.out_channels)
-        self.roll = params.roll
+        self.dt = dt
+        self.dhours = dhours
+        self.max_samples = max_samples
+        self.n_samples_per_epoch = n_samples_per_epoch
+        self.batch_size = batch_size
+        self.n_history = n_history
+        self.n_future = n_future
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.n_in_channels = len(in_channels)
+        self.n_out_channels = len(out_channels)
+        self.img_shape = img_shape
         self.device = device
-        self.io_grid = params.io_grid[1:]
-        self.io_rank = params.io_rank[1:]
-        if hasattr(params, "lat") and hasattr(params, "lon"):
-            self.lat_lon = (params.lat, params.lon)
+        self.return_timestamp = return_timestamp
+        self.return_target = return_target
+        self.io_grid = io_grid[1:]
+        self.io_rank = io_rank[1:]
+        if (latitudes is not None) and (longitudes is not None):
+            self.lat_lon = (latitudes, longitudes)
         else:
             self.lat_lon = None
 
-        if train:
-            self.n_samples_per_epoch = params.n_train_samples_per_epoch if hasattr(params, "n_train_samples_per_epoch") else None
-        else:
-            self.n_samples_per_epoch = params.n_eval_samples_per_epoch if hasattr(params, "n_eval_samples_per_epoch") else None
-
         # get cropping:
-        self.img_crop_shape_x = params.crop_size_x if hasattr(params, "crop_size_x") else None
-        self.img_crop_shape_y = params.crop_size_y if hasattr(params, "crop_size_y") else None
-        self.img_crop_offset_x = params.crop_anchor_x if hasattr(params, "crop_anchor_x") else 0
-        self.img_crop_offset_y = params.crop_anchor_y if hasattr(params, "crop_anchor_y") else 0
+        self.crop_shape = crop_size
+        self.crop_anchor = crop_anchor
 
         self._get_files_stats()
 
@@ -77,88 +101,123 @@ class DummyLoader(object):
             self.lat_lon = (latitude.tolist(), longitude.tolist())
 
         # zenith angle yes or no?
-        self.add_zenith = self.params.add_zenith
+        self.add_zenith = add_zenith
         if self.add_zenith:
             self.zen_dummy = torch.zeros((self.batch_size, self.n_history + 1, 1, self.img_local_shape_x, self.img_local_shape_y), dtype=torch.float32, device=self.device)
 
         # grid types
         self.grid_converter = GridConverter(
-            params.data_grid_type,
-            params.model_grid_type,
-            torch.deg2rad(torch.tensor(self.lat_lon[0])).to(torch.float32),
-            torch.deg2rad(torch.tensor(self.lat_lon[1])).to(torch.float32),
+            data_grid_type,
+            model_grid_type,
+            torch.deg2rad(torch.tensor(self.lat_lon[0][self.crop_anchor[0] : self.crop_anchor[0] + self.crop_shape[0]])).to(torch.float32),
+            torch.deg2rad(torch.tensor(self.lat_lon[1][self.crop_anchor[1] : self.crop_anchor[1] + self.crop_shape[1]])).to(torch.float32),
         )
 
     def _get_files_stats(self):
-        self.files_paths = glob.glob(self.location + "/*.h5")
 
-        self.prefix = f"Found data at path {self.location}."
-        if not self.files_paths:
-            print("Warning, no input files found, specifying dataset properties from parameter inputs")
-            self.n_years = self.params.n_years
-            self.n_samples_per_year = self.params.n_samples_per_year if hasattr(self.params, "n_samples_per_year") else 8760 // self.dhours
-            self.img_shape_x = self.params.img_shape_x
-            self.img_shape_y = self.params.img_shape_y
-            self.prefix = "Hallucinating data."
-        else:
+        if self.img_shape is None:
+            self.files_paths = glob.glob(self.location + "/*.h5")
+
+            if not self.files_paths:
+                raise RuntimeError(f"You have to specify img_shape if you do not provide a data path from which shapes can be deferred.")
+
             self.files_paths.sort()
-            self.n_years = len(self.files_paths)
-            with h5py.File(self.files_paths[0], "r") as _f:
-                logging.info("Getting file stats from {}".format(self.files_paths[0]))
-                self.n_samples_per_year = _f["fields"].shape[0]
-                # original image shape (before padding)
-                self.img_shape_x = _f["fields"].shape[2]
-                self.img_shape_y = _f["fields"].shape[3]
+
+            n_samples_total = 0
+            for fname in self.files_paths:
+                with h5py.File(fname, "r") as _f:
+                    n_samples_total += _f["fields"].shape[0]
+                    self.img_shape = _f["fields"].shape[2:4]
+
+            if self.n_samples_per_epoch is None:
+                self.n_samples_per_epoch = n_samples_total
+
+            if self.max_samples is None:
+                self.max_samples = n_samples_total
+
+            # the user can regulate the number of samples using either variables
+            self.n_samples_per_epoch = min(self.n_samples_per_epoch, self.max_samples)
+
+        else:
+            if (self.n_samples_per_epoch is not None) and (self.max_samples is None):
+                self.max_samples = self.n_samples_per_epoch
+            elif (self.n_samples_per_epoch is None) and (self.max_samples is not None):
+                self.n_samples_per_epoch = self.max_samples
+
+        # perform a sanity check here
+        if (self.n_samples_per_epoch == 0) or (self.n_samples_per_epoch is None):
+            raise RuntimeError(f"You have noit specified a valid number of samples per epoch.")
 
         # determine local read size:
         # sanitize the crops first
-        if self.img_crop_shape_x is None:
-            self.img_crop_shape_x = self.img_shape_x
-        if self.img_crop_shape_y is None:
-            self.img_crop_shape_y = self.img_shape_y
-        assert self.img_crop_offset_x + self.img_crop_shape_x <= self.img_shape_x
-        assert self.img_crop_offset_y + self.img_crop_shape_y <= self.img_shape_y
+        if self.crop_shape[0] is None:
+            self.crop_shape_x = self.img_shape[0]
+        else:
+            self.crop_shape_x = self.crop_shape[0]
+        if self.crop_shape[1] is None:
+            self.crop_shape_y = self.img_shape[1]
+        else:
+            self.crop_shape_y =	self.crop_shape[1]
+        self.crop_shape = (self.crop_shape_x, self.crop_shape_y)
+            
+        assert self.crop_anchor[0] + self.crop_shape[0] <= self.img_shape[0]
+        assert self.crop_anchor[1] + self.crop_shape[1] <= self.img_shape[1]
 
         # for x
-        split_shapes_x = compute_split_shapes(self.crop_size[0], self.io_grid[0])
+        split_shapes_x = compute_split_shapes(self.crop_shape[0], self.io_grid[0])
         read_shape_x = split_shapes_x[self.io_rank[0]]
-        read_anchor_x = self.crop_anchor[0] + sum(split_shapes_x[:self.io_rank[0]])
-        
+        read_anchor_x = sum(split_shapes_x[: self.io_rank[0]])
+
         # for y
-        split_shapes_y = compute_split_shapes(self.crop_size[1], self.io_grid[1])
+        split_shapes_y = compute_split_shapes(self.crop_shape[1], self.io_grid[1])
         read_shape_y = split_shapes_y[self.io_rank[1]]
-        read_anchor_y = self.crop_anchor[1] + sum(split_shapes_y[:self.io_rank[1]])
+        read_anchor_y = sum(split_shapes_y[: self.io_rank[1]])
 
         # store exposed variables
-        self.img_local_offset_x = read_anchor_x
-        self.img_local_offset_y = read_anchor_y
-        self.img_local_shape_x = read_shape_x
-        self.img_local_shape_y = read_shape_y
+        self.read_anchor = (read_anchor_x, read_anchor_y)
+        self.read_shape = (read_shape_x, read_shape_y)
+
+        # set properties for compatibility
+        self.img_shape_x = self.img_shape[0]
+        self.img_shape_y = self.img_shape[1]
+
+        self.img_crop_shape_x = self.crop_shape[0]
+        self.img_crop_shape_y = self.crop_shape[1]
+        self.img_crop_offset_x = self.crop_anchor[0]
+        self.img_crop_offset_y = self.crop_anchor[1]
+
+        self.img_local_shape_x = self.read_shape[0]
+        self.img_local_shape_y = self.read_shape[1]
+        self.img_local_offset_x = self.read_anchor[0]
+        self.img_local_offset_y = self.read_anchor[1]
 
         # sharding
-        self.n_samples_total = self.n_samples_per_epoch if self.n_samples_per_epoch is not None else self.n_years * self.n_samples_per_year
+        self.n_samples_total = self.n_samples_per_epoch
         self.n_samples_shard = self.n_samples_total // comm.get_size("data")
 
         # channels
         self.n_in_channels_local = self.n_in_channels
         self.n_out_channels_local = self.n_out_channels
 
-        self.files = [None for _ in range(self.n_years)]
-        logging.info(f"Number of samples per year: {self.n_samples_per_year}.")
-        logging.info(f"{self.prefix}. Number of examples: {self.n_samples_total}. Image Shape: {self.img_shape_x} x {self.img_shape_y} x {self.n_in_channels_local}")
+        logging.info(f"Number of examples: {self.n_samples_per_epoch}. Image Shape: {self.img_shape[0]} x {self.img_shape[1]} x {self.n_in_channels_local}")
         logging.info(f"Including {self.dhours*self.dt*self.n_history} hours of past history in training at a frequency of {self.dhours*self.dt} hours")
         logging.info("WARNING: using dummy data")
 
         # create tensors for dummy data
         self.device = torch.device(f"cuda:{comm.get_local_rank()}")
-        self.inp = torch.zeros((self.batch_size, self.n_history + 1, self.n_in_channels, self.img_local_shape_x, self.img_local_shape_y), dtype=torch.float32, device=self.device)
+        self.inp = torch.zeros((self.batch_size, self.n_history + 1, self.n_in_channels, self.read_shape[0], self.read_shape[1]), dtype=torch.float32, device=self.device)
         self.tar = torch.zeros(
-            (self.batch_size, self.n_future + 1, self.n_out_channels_local, self.img_local_shape_x, self.img_local_shape_y), dtype=torch.float32, device=self.device
+            (self.batch_size, self.n_future + 1, self.n_out_channels_local, self.read_shape[0], self.read_shape[1]), dtype=torch.float32, device=self.device
         )
 
         # initialize output
         self.inp.uniform_()
         self.tar.uniform_()
+
+        if self.return_timestamp:
+            self.inp_time = torch.zeros((self.batch_size, self.n_history + 1), dtype=torch.float64)
+            if self.return_target:
+                self.tar_time = torch.ones((self.batch_size, self.n_future + 1), dtype=torch.float64)
 
         self.in_bias = np.zeros((1, self.n_in_channels, 1, 1)).astype(np.float32)
         self.in_scale = np.ones((1, self.n_in_channels, 1, 1)).astype(np.float32)
@@ -182,9 +241,20 @@ class DummyLoader(object):
         if self.sample_idx < self.n_samples_shard:
             self.sample_idx += 1
 
+            result = (self.inp,)
+            if self.return_target:
+                result += (self.tar,)
+
             if self.add_zenith:
-                return self.inp, self.tar, self.zen_dummy, self.zen_dummy
-            else:
-                return self.inp, self.tar
+                result += (self.zen_dummy,)
+                if self.return_target:
+                    result += (self.zen_dummy,)
+
+            if self.return_timestamp:
+                result += (self.inp_time,)
+                if self.return_target:
+                    result += (self.tar_time,)
+
+            return result
         else:
             raise StopIteration()

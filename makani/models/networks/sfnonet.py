@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-from torch.cuda import amp
+from torch import amp
 
 from functools import partial
 
@@ -26,26 +25,28 @@ from functools import partial
 from makani.models.common import DropPath, MLP, EncoderDecoder
 
 # import global convolution and non-linear spectral layers
-from makani.models.common import SpectralConv, FactorizedSpectralConv, SpectralAttention
+from makani.models.common import SpectralConv, SpectralAttention
 
 # get spectral transforms from torch_harmonics
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
 
 # wrap fft, to unify interface to spectral transforms
-from makani.models.common import RealFFT2, InverseRealFFT2
-from makani.mpu.layers import DistributedRealFFT2, DistributedInverseRealFFT2, DistributedMLP, DistributedEncoderDecoder
+from makani.models.common import RealFFT2, InverseRealFFT2, GeometricInstanceNormS2
+from makani.mpu.fft import DistributedRealFFT2, DistributedInverseRealFFT2
+from makani.mpu.layers import DistributedMLP, DistributedEncoderDecoder
 
 # more distributed stuff
 from makani.utils import comm
 
 # layer normalization
-from modulus.distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
-from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm
+from physicsnemo.distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
+from makani.mpu.layer_norm import DistributedInstanceNorm2d, DistributedLayerNorm, DistributedGeometricInstanceNormS2
 
 # for annotation of models
-import modulus
-from modulus.models.meta import ModelMetaData
+from dataclasses import dataclass
+import physicsnemo
+from physicsnemo.models.meta import ModelMetaData
 
 
 class SpectralFilterLayer(nn.Module):
@@ -57,7 +58,6 @@ class SpectralFilterLayer(nn.Module):
         filter_type="linear",
         operator_type="diagonal",
         hidden_size_factor=1,
-        factorization=None,
         rank=1.0,
         separable=False,
         complex_activation="real",
@@ -83,27 +83,13 @@ class SpectralFilterLayer(nn.Module):
                 gain=gain,
             )
 
-        elif filter_type == "linear" and factorization is None:
+        elif filter_type == "linear":
             self.filter = SpectralConv(
                 forward_transform,
                 inverse_transform,
                 embed_dim,
                 embed_dim,
                 operator_type=operator_type,
-                separable=separable,
-                bias=bias,
-                gain=gain,
-            )
-
-        elif filter_type == "linear" and factorization is not None:
-            self.filter = FactorizedSpectralConv(
-                forward_transform,
-                inverse_transform,
-                embed_dim,
-                embed_dim,
-                operator_type=operator_type,
-                rank=rank,
-                factorization=factorization,
                 separable=separable,
                 bias=bias,
                 gain=gain,
@@ -116,7 +102,7 @@ class SpectralFilterLayer(nn.Module):
         return self.filter(x)
 
 
-class FourierNeuralOperatorBlock(nn.Module):
+class NeuralOperatorBlock(nn.Module):
     def __init__(
         self,
         forward_transform,
@@ -130,7 +116,6 @@ class FourierNeuralOperatorBlock(nn.Module):
         act_layer=nn.GELU,
         norm_layer=(nn.Identity, nn.Identity),
         rank=1.0,
-        factorization=None,
         separable=False,
         inner_skip="linear",
         outer_skip=None,
@@ -141,16 +126,14 @@ class FourierNeuralOperatorBlock(nn.Module):
         spectral_layers=1,
         bias=False,
         final_activation=False,
-        checkpointing=0,
+        checkpointing_level=0,
     ):
-        super(FourierNeuralOperatorBlock, self).__init__()
+        super().__init__()
 
         # determine some shapes
         if comm.get_size("spatial") > 1:
-            self.input_shape_loc = (forward_transform.lat_shapes[comm.get_rank("h")],
-                                    forward_transform.lon_shapes[comm.get_rank("w")])
-            self.output_shape_loc = (inverse_transform.lat_shapes[comm.get_rank("h")],
-                                     inverse_transform.lon_shapes[comm.get_rank("w")])
+            self.input_shape_loc = (forward_transform.lat_shapes[comm.get_rank("h")], forward_transform.lon_shapes[comm.get_rank("w")])
+            self.output_shape_loc = (inverse_transform.lat_shapes[comm.get_rank("h")], inverse_transform.lon_shapes[comm.get_rank("w")])
         else:
             self.input_shape_loc = (forward_transform.nlat, forward_transform.nlon)
             self.output_shape_loc = (inverse_transform.nlat, inverse_transform.nlon)
@@ -183,7 +166,6 @@ class FourierNeuralOperatorBlock(nn.Module):
             filter_type,
             operator_type,
             hidden_size_factor=mlp_ratio,
-            factorization=factorization,
             rank=rank,
             separable=separable,
             complex_activation=complex_activation,
@@ -226,7 +208,7 @@ class FourierNeuralOperatorBlock(nn.Module):
                 drop_type="features",
                 comm_inp_name=comm_feature_inp_name,
                 comm_hidden_name=comm_feature_hidden_name,
-                checkpointing=checkpointing,
+                checkpointing=(checkpointing_level>=2),
                 gain=gain_factor,
             )
 
@@ -286,7 +268,6 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         out_chans=2,
         embed_dim=32,
         num_layers=4,
-        repeat_layers=1,
         use_mlp=True,
         mlp_ratio=2.0,
         encoder_ratio=1,
@@ -302,12 +283,11 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         hard_thresholding_fraction=1.0,
         big_skip=True,
         rank=1.0,
-        factorization=None,
         separable=False,
         complex_activation="real",
         spectral_layers=3,
         bias=False,
-        checkpointing=0,
+        checkpointing_level=0,
         **kwargs,
     ):
         super(SphericalFourierNeuralOperatorNet, self).__init__()
@@ -317,9 +297,8 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         self.inp_chans = inp_chans
         self.out_chans = out_chans
         self.embed_dim = embed_dim
-        self.repeat_layers = repeat_layers
         self.big_skip = big_skip
-        self.checkpointing = checkpointing
+        self.checkpointing_level = checkpointing_level
 
         # compute the downscaled image size
         self.h = int(self.inp_shape[0] // scale_factor)
@@ -378,6 +357,35 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             else:
                 norm_layer_inp = partial(nn.InstanceNorm2d, num_features=embed_dim, eps=1e-6, affine=True, track_running_stats=False)
             norm_layer_out = norm_layer_mid = norm_layer_inp
+        elif normalization_layer == "instance_norm_s2":
+            norm_layer_handle = DistributedGeometricInstanceNormS2 if comm.get_size("spatial") > 1 else GeometricInstanceNormS2
+            norm_layer_inp = partial(
+                norm_layer_handle,
+                img_shape=(self.h, self.w),
+                crop_shape=(self.h, self.w),
+                crop_offset=(0, 0),
+                grid_type=model_grid_type,
+                pole_mask=0,
+                num_features=embed_dim,
+                eps=1e-6,
+                affine=True,
+            )
+            norm_layer_mid = norm_layer_inp
+            norm_layer_out = partial(
+                norm_layer_handle,
+                img_shape=out_shape,
+                crop_shape=out_shape,
+                crop_offset=(0, 0),
+                grid_type=model_grid_type,
+                pole_mask=0,
+                num_features=embed_dim,
+                eps=1e-6,
+                affine=True,
+            )
+            # norm_layer_mid = partial(norm_layer_handle,
+            #                         img_shape=(self.h, self.w), crop_shape=(self.h, self.w), crop_offset=(0,0),
+            #                         grid_type=sht_grid_type, pole_mask=0,
+        #                         num_features=embed_dim, eps=1e-6, affine=True)
         elif normalization_layer == "none":
             norm_layer_out = norm_layer_mid = norm_layer_inp = nn.Identity
         else:
@@ -398,11 +406,11 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             if first_layer:
                 norm_layer = (norm_layer_inp, norm_layer_mid)
             elif last_layer:
-                norm_layer = (norm_layer_mid, norm_layer_out)
+                norm_layer = (norm_layer_out, norm_layer_out)
             else:
                 norm_layer = (norm_layer_mid, norm_layer_mid)
 
-            block = FourierNeuralOperatorBlock(
+            block = NeuralOperatorBlock(
                 forward_transform,
                 inverse_transform,
                 embed_dim,
@@ -419,12 +427,11 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
                 comm_feature_inp_name=fblock_mlp_inp_name,
                 comm_feature_hidden_name=fblock_mlp_hidden_name,
                 rank=rank,
-                factorization=factorization,
                 separable=separable,
                 complex_activation=complex_activation,
                 spectral_layers=spectral_layers,
                 bias=bias,
-                checkpointing=checkpointing,
+                checkpointing_level=checkpointing_level,
             )
 
             self.blocks.append(block)
@@ -444,8 +451,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
                 comm_out_name=comm_out_name,
                 input_format="nchw",
             )
-            self.gather_shapes = compute_split_shapes(self.out_chans,
-                                                      comm.get_size(self.decoder.comm_out_name))
+            self.gather_shapes = compute_split_shapes(self.out_chans, comm.get_size(self.decoder.comm_out_name))
 
         else:
             self.decoder = EncoderDecoder(
@@ -499,7 +505,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         else:
             raise ValueError("Unknown position embedding type")
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=True)
     def _init_spectral_transforms(
         self,
         spectral_transform="sht",
@@ -519,6 +525,12 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             modes_lat = int(self.h * hard_thresholding_fraction)
             modes_lon = int((self.w // 2 + 1) * hard_thresholding_fraction)
 
+        # check for distributed
+        if (comm.get_size("spatial") > 1) and (not thd.is_initialized()):
+            polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
+            azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
+            thd.init(polar_group, azimuth_group)
+
         # prepare the spectral transforms
         if spectral_transform == "sht":
             sht_handle = th.RealSHT
@@ -526,9 +538,6 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
 
             # parallelism
             if comm.get_size("spatial") > 1:
-                polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
-                azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
-                thd.init(polar_group, azimuth_group)
                 sht_handle = thd.DistributedRealSHT
                 isht_handle = thd.DistributedInverseRealSHT
 
@@ -543,9 +552,6 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             ifft_handle = InverseRealFFT2
 
             if comm.get_size("spatial") > 1:
-                h_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
-                w_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
-                thd.init(h_group, w_group)
                 fft_handle = DistributedRealFFT2
                 ifft_handle = DistributedInverseRealFFT2
 
@@ -558,10 +564,8 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
 
         # use the SHT/FFT to compute the local, downscaled grid dimensions
         if comm.get_size("spatial") > 1:
-            self.inp_shape_loc = (self.trans_down.lat_shapes[comm.get_rank("h")],
-                                  self.trans_down.lon_shapes[comm.get_rank("w")])
-            self.out_shape_loc = (self.itrans_up.lat_shapes[comm.get_rank("h")],
-                                  self.itrans_up.lon_shapes[comm.get_rank("w")])
+            self.inp_shape_loc = (self.trans_down.lat_shapes[comm.get_rank("h")], self.trans_down.lon_shapes[comm.get_rank("w")])
+            self.out_shape_loc = (self.itrans_up.lat_shapes[comm.get_rank("h")], self.itrans_up.lon_shapes[comm.get_rank("w")])
             self.h_loc = self.itrans.lat_shapes[comm.get_rank("h")]
             self.w_loc = self.itrans.lon_shapes[comm.get_rank("w")]
         else:
@@ -570,17 +574,16 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
             self.h_loc = self.itrans.nlat
             self.w_loc = self.itrans.nlon
 
-    @torch.jit.ignore
+    @torch.compiler.disable(recursive=True)
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 
     def _forward_features(self, x):
-        for r in range(self.repeat_layers):
-            for blk in self.blocks:
-                if self.checkpointing >= 3:
-                    x = checkpoint(blk, x, use_reentrant=False)
-                else:
-                    x = blk(x)
+        for blk in self.blocks:
+            if self.checkpointing_level >= 3:
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
 
         return x
 
@@ -592,7 +595,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
                 xtype = x.dtype
                 # only take the predicted channels as residual
                 residual = x.to(torch.float32)
-                with amp.autocast(enabled=False):
+                with amp.autocast(device_type="cuda", enabled=False):
                     residual = self.trans_down(residual)
                     residual = residual.contiguous()
                     residual = self.itrans_up(residual)
@@ -604,7 +607,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         if comm.get_size("fin") > 1:
             x = scatter_to_parallel_region(x, 1, "fin")
 
-        if self.checkpointing >= 1:
+        if self.checkpointing_level >= 1:
             x = checkpoint(self.encoder, x, use_reentrant=False)
         else:
             x = self.encoder(x)
@@ -612,7 +615,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         if hasattr(self, "pos_embed"):
             if self.pos_embed.type == "frequency":
                 pos_embed = torch.stack([self.pos_embed[0], nn.functional.pad(self.pos_embed[1], (1, 0), "constant", 0)], dim=-1)
-                with amp.autocast(enabled=False):
+                with amp.autocast(device_type="cuda", enabled=False):
                     pos_embed = self.itrans_up(torch.view_as_complex(pos_embed))
             else:
                 pos_embed = self.pos_embed
@@ -626,7 +629,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
         # do the feature extraction
         x = self._forward_features(x)
 
-        if self.checkpointing >= 1:
+        if self.checkpointing_level >= 1:
             x = checkpoint(self.decoder, x, use_reentrant=False)
         else:
             x = self.decoder(x)
@@ -639,6 +642,7 @@ class SphericalFourierNeuralOperatorNet(nn.Module):
 
         return x
 
+
 # this part exposes the model to modulus by constructing modulus Modules
 @dataclass
 class SphericalFourierNeuralOperatorNetMetaData(ModelMetaData):
@@ -649,14 +653,14 @@ class SphericalFourierNeuralOperatorNetMetaData(ModelMetaData):
     amp_cpu: bool = False
     amp_gpu: bool = True
 
-SFNO = modulus.Module.from_torch(
-    SphericalFourierNeuralOperatorNet,
-    SphericalFourierNeuralOperatorNetMetaData()
-)
+
+SFNO = physicsnemo.Module.from_torch(SphericalFourierNeuralOperatorNet, SphericalFourierNeuralOperatorNetMetaData())
+
 
 class FourierNeuralOperatorNet(SphericalFourierNeuralOperatorNet):
     def __init__(self, *args, **kwargs):
         return super().__init__(*args, spectral_transform="fft", **kwargs)
+
 
 @dataclass
 class FourierNeuralOperatorNetMetaData(ModelMetaData):
@@ -667,7 +671,5 @@ class FourierNeuralOperatorNetMetaData(ModelMetaData):
     amp_cpu: bool = False
     amp_gpu: bool = True
 
-FNO = modulus.Module.from_torch(
-    FourierNeuralOperatorNet,
-    FourierNeuralOperatorNetMetaData()
-)
+
+FNO = physicsnemo.Module.from_torch(FourierNeuralOperatorNet, FourierNeuralOperatorNetMetaData())

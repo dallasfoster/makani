@@ -1,11 +1,13 @@
-*.h5
 __pycache__
+*.h5
 *.out
 expts/
 wandb/
+build/
 data_process/.ipynb_checkpoints/*
 notebooks/.ipynb_checkpoints/*
 utils/.ipynb_checkpoints/*
+.devcontainer/
 *.png
 .ipynb_checkpoints/*
 *.tar
@@ -21,4 +23,3 @@ coverage.xml
 *.coverage
 *.hypothesis
 *.egg-info/
-build/

@@ -17,7 +17,7 @@ ARG DLFW_VERSION
 FROM nvcr.io/nvidia/pytorch:${DLFW_VERSION}-py3
 
 # update repo info
-RUN apt update -y
+RUN apt update -y && apt install -y libibmad5
 
 # upgrade cmake
 RUN apt remove cmake -y && \
@@ -26,27 +26,38 @@ RUN apt remove cmake -y && \
 # install mpi4py
 RUN SETUPTOOLS_USE_DISTUTILS=local pip install mpi4py
 
+# install onnx
+RUN pip install onnx onnxruntime onnxruntime-gpu
+
 # hdf5 and h5py
-RUN cd /tmp && wget https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.14/hdf5-1.14.3/src/hdf5-1.14.3.tar.gz && \
-    gzip -cd hdf5-1.14.3.tar.gz | tar xvf - && \
-    mkdir hdf5-1.14.3/build && cd hdf5-1.14.3/build && \
+ENV HDF5_VERSION=1.14.6
+RUN cd /tmp && wget https://support.hdfgroup.org/releases/hdf5/v1_14/v1_14_6/downloads/hdf5-${HDF5_VERSION}.tar.gz && \
+    gzip -cd hdf5-${HDF5_VERSION}.tar.gz | tar xvf - && \
+    mkdir hdf5-${HDF5_VERSION}/build && cd hdf5-${HDF5_VERSION}/build && \
     cmake -DCMAKE_INSTALL_PREFIX=/opt/hdf5 \
-    -DHDF5_ENABLE_DIRECT_VFD=1 \
-    -DHDF5_ENABLE_PARALLEL=0 \
-    -DHDF5_TEST_API=1 \
-    -DHDF5_TEST_VFD=1 \
+    -DHDF5_ENABLE_OPTIMIZATION=ON \
+    -DHDF5_ENABLE_DIRECT_VFD=ON \
+    -DHDF5_ENABLE_ROS3_VFD=ON \
+    -DHDF5_ENABLE_PARALLEL=ON \
+    -DHDF5_TEST_API=ON \
+    -DHDF5_TEST_VFD=ON \
+    -DHDF5_TEST_PARALLEL=ON \
     .. && \
     make -j 8 && make install
-RUN CC="mpicc" HDF5_MPI=OFF H5PY_DIRECT_VFD=1 HDF5_DIR=/opt/hdf5 pip install --no-binary=h5py h5py
+RUN CC="mpicc" HDF5_MPI=ON H5PY_ROS3=1 H5PY_DIRECT_VFD=1 HDF5_DIR=/opt/hdf5 pip install --no-build-isolation --no-binary=h5py h5py==3.13.0
+ENV PATH=/opt/hdf5/bin:${PATH}
 
-# install zarr
-RUN pip install zarr netCDF4 xarray pandas
+# install cdsapi for downloading the dataset
+RUN pip install cdsapi>=0.7.2
+
+# install zarr and data stuff
+RUN pip install more_itertools zarr xarray pandas gcsfs boto3
 
 # moviepy imageio for wandb video logging
 RUN pip install moviepy imageio
 
 # other python stuff
-RUN pip install --upgrade wandb ruamel.yaml tqdm jsbeautifier
+RUN pip install --upgrade wandb ruamel.yaml tqdm progressbar2 jsbeautifier
 
 # numba
 RUN pip install numba
@@ -61,29 +72,16 @@ RUN pip install git+https://github.com/romerojosh/benchy.git
 # some useful scripts from mlperf
 RUN pip install --ignore-installed "git+https://github.com/NVIDIA/mlperf-common.git"
 
-# install python version checker
-RUN mkdir /opt/utils && cd /opt/utils && \
-    wget https://raw.githubusercontent.com/pytorch/pytorch/master/torch/utils/collect_env.py
-
-# install tensorly for compression experiments
-RUN cd /opt && git clone https://github.com/tensorly/tensorly && \
-    cd tensorly && \
-    pip install -e .
-
-RUN cd /opt && git clone https://github.com/tensorly/torch tensorly-torch && \
-    cd tensorly-torch && \
-    pip install -e .
-
 # torch-harmonics
-ENV HARMONICS_VERSION 0.6.4
-RUN cd /opt && git clone -b v0.6.4 https://github.com/NVIDIA/torch-harmonics.git && \
+ENV FORCE_CUDA_EXTENSION 1
+ENV TORCH_CUDA_ARCH_LIST "8.0 8.6 9.0 10.0 12.0+PTX"
+ENV HARMONICS_VERSION 0.8.0
+RUN cd /opt && git clone https://github.com/NVIDIA/torch-harmonics.git && \
     cd torch-harmonics && \
-    pip install -e .
+    pip install --no-build-isolation -e .
 
-# modulus
-RUN cd /opt && git clone https://github.com/NVIDIA/modulus.git && \
-    cd modulus && \
-    pip install -e .
+# physicsnemo
+RUN pip install git+https://github.com/NVIDIA/physicsnemo.git@v1.1.1
 
 # copy source code
 RUN mkdir -p /opt/makani
@@ -94,11 +92,5 @@ COPY datasets /opt/makani/datasets
 COPY makani /opt/makani/makani
 COPY tests /opt/makani/tests
 COPY pyproject.toml /opt/makani/pyproject.toml
+COPY README.md /opt/makani/README.md
 RUN cd /opt/makani && pip install -e .
-
-# install patches:
-# temporary WAR to enable complex optimization in ADAM
-# copy custom optimizers to torch
-COPY makani/third_party/torch/optim/* /usr/local/lib/python3.10/dist-packages/torch/optim/
-# hack distributed
-COPY makani/third_party/torch/distributed/* /usr/local/lib/python3.10/dist-packages/torch/distributed/

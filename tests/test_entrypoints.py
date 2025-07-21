@@ -34,7 +34,7 @@ from importlib.metadata import entry_points, EntryPoint
 class TestEntryPoints(unittest.TestCase):
 
     def setUp(self):
-        self.model_entry_points = {entry_point.name: entry_point for entry_point in entry_points(group="modulus.models") if not entry_point.value.startswith("modulus.experimental.models")}
+        self.model_entry_points = {entry_point.name: entry_point for entry_point in entry_points(group="physicsnemo.models") if not entry_point.value.startswith("physicsnemo.experimental.models")}
 
     @parameterized.expand(["SFNO"])
     def test_model_entry_points(self, model_name):

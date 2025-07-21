@@ -18,6 +18,20 @@ import torch
 
 from torch_harmonics.quadrature import legendre_gauss_weights, clenshaw_curtiss_weights
 
+from makani.utils import comm
+from physicsnemo.distributed.utils import compute_split_shapes
+from physicsnemo.distributed.mappings import reduce_from_parallel_region
+
+
+def grid_to_quadrature_rule(grid_type):
+
+    grid_to_quad_dict = {"euclidean" : "uniform", "equiangular" : "naive", "legendre-gauss" : "legendre-gauss", "clenshaw-curtiss" : "clenshaw-curtiss", "weatherbench2" : "weatherbench2"}
+
+    if grid_type not in grid_to_quad_dict.keys():
+        raise NotImplementedError(f"Grid type {grid_type} does not have a quadrature rule")
+    else:
+        return grid_to_quad_dict[grid_type]
+
 
 class GridConverter(torch.nn.Module):
     def __init__(self, src_grid, dst_grid, lat_rad, lon_rad):
@@ -61,8 +75,11 @@ class GridConverter(torch.nn.Module):
 
 
 class GridQuadrature(torch.nn.Module):
-    def __init__(self, quadrature_rule, img_shape, crop_shape=None, crop_offset=(0, 0), normalize=False, pole_mask=None):
-        super(GridQuadrature, self).__init__()
+    def __init__(self, quadrature_rule, img_shape, crop_shape=None, crop_offset=(0, 0), normalize=False, pole_mask=None, distributed=False):
+        super().__init__()
+
+        self.distributed = comm.is_distributed("spatial") and distributed
+        crop_shape = img_shape if crop_shape is None else crop_shape
 
         if quadrature_rule == "naive":
             jacobian = torch.clamp(torch.sin(torch.linspace(0, torch.pi, img_shape[0])), min=0.0)
@@ -74,17 +91,28 @@ class GridQuadrature(torch.nn.Module):
             # numerical precision can be an issue here, make sure it sums to 4pi:
             quad_weight = quad_weight * (4.0 * torch.pi) / torch.sum(quad_weight)
         elif quadrature_rule == "clenshaw-curtiss":
-            cost, w = clenshaw_curtiss_weights(img_shape[0], -1, 1)
-            weights = torch.from_numpy(w)
+            cost, weights = clenshaw_curtiss_weights(img_shape[0], -1, 1)
             dlambda = 2 * torch.pi / img_shape[1]
-            quad_weight = dlambda * torch.from_numpy(w).unsqueeze(1)
+            quad_weight = dlambda * weights.unsqueeze(1)
             quad_weight = quad_weight.tile(1, img_shape[1])
         elif quadrature_rule == "legendre-gauss":
-            cost, w = legendre_gauss_weights(img_shape[0], -1, 1)
-            weights = torch.from_numpy(w)
+            cost, weights = legendre_gauss_weights(img_shape[0], -1, 1)
             dlambda = 2 * torch.pi / img_shape[1]
-            quad_weight = dlambda * torch.from_numpy(w).unsqueeze(1)
+            quad_weight = dlambda * weights.unsqueeze(1)
             quad_weight = quad_weight.tile(1, img_shape[1])
+        elif quadrature_rule == "weatherbench2":
+            # compute the 'integrated area weight' that weatherbench2 uses
+            lats = torch.linspace(0, torch.pi, img_shape[0])
+            cell_bounds = torch.cat([torch.as_tensor([0]), (lats[:-1] + lats[1:]) / 2, torch.as_tensor([torch.pi])])
+            jacobian = torch.cos(cell_bounds[:-1]) - torch.cos(cell_bounds[1:])
+            dlambda = 2 * torch.pi / img_shape[1]
+            quad_weight = dlambda * jacobian.unsqueeze(1)
+            quad_weight = quad_weight.tile(1, img_shape[1])
+        elif quadrature_rule == "uniform":
+            quad_weight = torch.ones((img_shape[0],)).unsqueeze(1)
+            quad_weight = quad_weight.tile(1, img_shape[1])
+            # normalize to 4pi
+            quad_weight = 4.0 * torch.pi * quad_weight / torch.sum(quad_weight)
         else:
             raise ValueError(f"Unknown quadrature rule {quadrature_rule}")
 
@@ -97,9 +125,29 @@ class GridQuadrature(torch.nn.Module):
             quad_weight[:pole_mask, :] = 0.0
             quad_weight[sizes[0] - pole_mask :, :] = 0.0
 
+        # if distributed, make sure to split correctly across ranks:
+        # in case of model parallelism, we need to make sure that we use the correct shapes per rank
+        # for h
+        if self.distributed and (comm.get_size("h") > 1):
+            shapes_h = compute_split_shapes(crop_shape[0], comm.get_size("h"))
+            local_shape_h = shapes_h[comm.get_rank("h")]
+            local_offset_h = crop_offset[0] + sum(shapes_h[: comm.get_rank("h")])
+        else:
+            local_shape_h = crop_shape[0]
+            local_offset_h = crop_offset[0]
+
+        # for w
+        if self.distributed and (comm.get_size("w") > 1):
+            shapes_w = compute_split_shapes(crop_shape[1], comm.get_size("w"))
+            local_shape_w = shapes_w[comm.get_rank("w")]
+            local_offset_w = crop_offset[1] + sum(shapes_w[: comm.get_rank("w")])
+        else:
+            local_shape_w = crop_shape[1]
+            local_offset_w = crop_offset[1]
+
         # crop globally if requested
         if crop_shape is not None:
-            quad_weight = quad_weight[crop_offset[0] : crop_offset[0] + crop_shape[0], crop_offset[1] : crop_offset[1] + crop_shape[1]]
+            quad_weight = quad_weight[local_offset_h : local_offset_h + local_shape_h, local_offset_w : local_offset_w + local_shape_w]
 
         # make it contiguous
         quad_weight = quad_weight.contiguous()
@@ -108,8 +156,12 @@ class GridQuadrature(torch.nn.Module):
         H, W = quad_weight.shape
         quad_weight = quad_weight.reshape(1, 1, H, W)
 
-        self.register_buffer("quad_weight", quad_weight)
+        self.register_buffer("quad_weight", quad_weight, persistent=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # integrate over last two axes only:
-        return torch.sum(x * self.quad_weight, dim=(-2, -1))
+        quad = torch.sum(x * self.quad_weight, dim=(-2, -1))
+        if self.distributed and (comm.get_size("spatial") > 1):
+            quad = reduce_from_parallel_region(quad.contiguous(), "spatial")
+
+        return quad

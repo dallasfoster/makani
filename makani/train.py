@@ -18,58 +18,30 @@ import numpy as np
 import argparse
 import torch
 import logging
+from functools import partial
 
 # utilities
+from makani.utils.profiling import Timer
 from makani.utils import logging_utils
 from makani.utils.YParams import YParams
 
 # distributed computing stuff
 from makani.utils import comm
+from makani.utils.parse_dataset_metada import parse_dataset_metadata
+from makani.utils import argument_parser
+from makani.utils import profiling
 
 # import trainer
-from makani.utils.parse_dataset_metada import parse_dataset_metadata
 from makani import Trainer
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fin_parallel_size", default=1, type=int, help="Input feature paralellization")
-    parser.add_argument("--fout_parallel_size", default=1, type=int, help="Output feature paralellization")
-    parser.add_argument("--h_parallel_size", default=1, type=int, help="Spatial parallelism dimension in h")
-    parser.add_argument("--w_parallel_size", default=1, type=int, help="Spatial parallelism dimension in w")
-    parser.add_argument("--parameters_reduction_buffer_count", default=1, type=int, help="How many buffers will be used (approximately) for weight gradient reductions.")
-    parser.add_argument("--run_num", default="00", type=str)
-    parser.add_argument("--yaml_config", default="./config/sfnonet.yaml", type=str)
-    parser.add_argument("--config", default="base_73chq", type=str)
-    parser.add_argument("--batch_size", default=-1, type=int, help="Switch for overriding batch size in the configuration file.")
-    parser.add_argument("--enable_synthetic_data", action="store_true")
-    parser.add_argument("--amp_mode", default="none", type=str, choices=["none", "fp16", "bf16"], help="Specify the mixed precision mode which should be used.")
-    parser.add_argument("--jit_mode", default="none", type=str, choices=["none", "script", "inductor"], help="Specify if and how to use torch jit.")
-    parser.add_argument("--cuda_graph_mode", default="none", type=str, choices=["none", "fwdbwd", "step"], help="Specify which parts to capture under cuda graph")
-    parser.add_argument("--enable_odirect", action="store_true")
-    parser.add_argument("--checkpointing_level", default=0, type=int, help="How aggressively checkpointing is used")
-    parser.add_argument("--epsilon_factor", default=0, type=float)
-    parser.add_argument("--split_data_channels", action="store_true")
-    parser.add_argument("--print_timings_frequency", default=-1, type=int, help="Frequency at which to print timing information")
-    parser.add_argument("--skip_validation", action="store_true", help="Flag to allow validation skipping, useful for profiling and debugging")
+    parser = argument_parser.get_default_argument_parser()
     parser.add_argument("--mode", default="train", type=str, choices=["train", "test"], help="Run training or perform a test")
-
-    # checkpoint format
-    parser.add_argument("--save_checkpoint", default="legacy", choices=["none", "flexible", "legacy"], type=str, help="Format in which to save checkpoints.")
-    parser.add_argument("--load_checkpoint", default="legacy", choices=["flexible", "legacy"], type=str, help="Format in which to load checkpoints.")
-    # multistep stuff
-    parser.add_argument("--multistep_count", default=1, type=int, help="Number of autoregressive training steps. A value of 1 denotes conventional training")
-
-    # debug parameters
-    parser.add_argument("--enable_benchy", action="store_true")
-    parser.add_argument("--disable_ddp", action="store_true")
-    parser.add_argument("--enable_grad_anomaly_detection", action="store_true")
-
     # parse
     args = parser.parse_args()
 
     # parse parameters
     params = YParams(os.path.abspath(args.yaml_config), args.config)
-    params["epsilon_factor"] = args.epsilon_factor
 
     # distributed
     params["fin_parallel_size"] = args.fin_parallel_size
@@ -86,10 +58,11 @@ if __name__ == "__main__":
     params["save_checkpoint"] = args.save_checkpoint
 
     # make sure to reconfigure logger after the pytorch distributed init
-    comm.init(model_parallel_sizes=params["model_parallel_sizes"],
-              model_parallel_names=params["model_parallel_names"],
-              verbose=False)
+    with Timer() as timer:
+        comm.init(model_parallel_sizes=params["model_parallel_sizes"], model_parallel_names=params["model_parallel_names"], verbose=False)
     world_rank = comm.get_world_rank()
+    if world_rank == 0:
+        print(f"Communicators wireup time: {timer.time:.2f}s")
 
     # update parameters
     params["world_size"] = comm.get_world_size()
@@ -123,23 +96,24 @@ if __name__ == "__main__":
             os.makedirs(os.path.join(expDir, "wandb"), exist_ok=True)
 
     params["experiment_dir"] = os.path.abspath(expDir)
-    params["checkpoint_path"] = os.path.join(expDir, "training_checkpoints/ckpt_mp{mp_rank}.tar")
+    params["checkpoint_path"] = os.path.join(expDir, "training_checkpoints/ckpt_mp{mp_rank}_v{checkpoint_version}.tar")
     params["best_checkpoint_path"] = os.path.join(expDir, "training_checkpoints/best_ckpt_mp{mp_rank}.tar")
 
     # check if all files are there - do not comment out.
     resuming = True
     for mp_rank in range(comm.get_size("model")):
-        checkpoint_fname = params.checkpoint_path.format(mp_rank=mp_rank)
+        checkpoint_fname = params.checkpoint_path.format(mp_rank=mp_rank, checkpoint_version=0)
         if params["load_checkpoint"] == "legacy" or mp_rank < 1:
             resuming = resuming and os.path.isfile(checkpoint_fname)
 
     params["resuming"] = resuming
     params["amp_mode"] = args.amp_mode
     params["jit_mode"] = args.jit_mode
-    params["cuda_graph_mode"] = args.cuda_graph_mode
     params["skip_validation"] = args.skip_validation
+    params["skip_training"] = args.skip_training
     params["enable_odirect"] = args.enable_odirect
-    params["checkpointing"] = args.checkpointing_level
+    params["enable_s3"] = args.enable_s3
+    params["checkpointing_level"] = args.checkpointing_level
     params["enable_synthetic_data"] = args.enable_synthetic_data
     params["split_data_channels"] = args.split_data_channels
     params["print_timings_frequency"] = args.print_timings_frequency
@@ -171,13 +145,35 @@ if __name__ == "__main__":
     else:
         raise RuntimeError(f"Error, please specify a dataset descriptor file in json format")
 
-    # instantiate trainer / inference / ensemble object
-    if args.mode == "train":
-        trainer = Trainer(params, world_rank)
-        trainer.train()
-    elif args.mode == "test":
-        params["nettype"] = "DebugNet"
-        trainer = Trainer(params, world_rank)
-        trainer.test_autoregression_pipeline()
+    # instantiate trainer
+    trainer = Trainer(params, world_rank)
+    # if profiling is enabled, use context manager here:
+    if world_rank in args.capture_ranks:
+        if args.capture_type == "torch":
+            capture_prefix = f"{args.capture_prefix}_rank{world_rank}" if args.capture_prefix is not None else None
+            trace_handler = partial(profiling.trace_handler, print_stats=True, export_trace_prefix=capture_prefix)
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(wait=args.capture_range_start - 1, warmup=1, active=args.capture_range_stop - args.capture_range_start, repeat=1),
+                on_trace_ready=trace_handler,
+            ) as profiler:
+                if args.capture_mode == "training":
+                    trainer.train(training_profiler=profiler)
+                elif args.capture_mode == "validation":
+                    trainer.train(validation_profiler=profiler)
+
+        elif args.capture_type == "cupti":
+            with profiling.CUDAProfiler(capture_range_start=args.capture_range_start, capture_range_stop=args.capture_range_stop, enabled=True) as profiler:
+                with torch.autograd.profiler.emit_nvtx(enabled=True, record_shapes=False):
+                    if args.capture_mode == "training":
+                        trainer.train(training_profiler=profiler)
+                    elif args.capture_mode == "validation":
+                        trainer.train(validation_profiler=profiler)
     else:
-        raise ValueError(f"Unknown training mode {args.mode}")
+        trainer.train()
+
+    # cleanup
+    comm.cleanup()

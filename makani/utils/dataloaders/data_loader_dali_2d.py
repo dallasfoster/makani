@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import logging
 import glob
 import torch
@@ -35,14 +36,21 @@ import torch.distributed as dist
 from makani.utils import comm
 
 # es helper
-import makani.utils.dataloaders.dali_es_helper_2d as esh
+from makani.utils.dataloaders.data_helpers import get_data_normalization
 from makani.utils.grids import GridConverter
 
 
 class ERA5DaliESDataloader(object):
+
     def get_pipeline(self):
         pipeline = Pipeline(
-            batch_size=self.batchsize, num_threads=2, device_id=self.device_index, py_num_workers=self.num_data_workers, py_start_method="spawn", seed=self.global_seed
+            batch_size=self.batchsize,
+            num_threads=2,
+            device_id=self.device_index,
+            py_num_workers=self.num_data_workers,
+            py_start_method="spawn",
+            seed=self.global_seed,
+            prefetch_queue_depth=2,
         )
 
         img_shape_x = self.img_shape_x
@@ -50,65 +58,80 @@ class ERA5DaliESDataloader(object):
         in_channels = self.in_channels
         out_channels = self.out_channels
 
+        num_outputs = 2
+        layout = ["FCHW", "FCHW"]
+        if self.add_zenith:
+            num_outputs += 2
+            layout += ["FCHW", "FCHW"]
+        if self.return_timestamp:
+            num_outputs += 2
+            layout += ["F"]
+
         with pipeline:
             # get input and target
             data = fn.external_source(
                 source=self.extsource,
-                num_outputs=4 if self.add_zenith else 2,
-                layout=["FCHW", "FCHW", "FCHW", "FCHW"] if self.add_zenith else ["FCHW", "FCHW"],
+                num_outputs=num_outputs,
+                layout=layout,
                 batch=False,
                 no_copy=True,
                 parallel=True,
                 prefetch_queue_depth=self.num_data_workers,
             )
 
+            inp = data[0]
+            tar = data[1]
+            off = 2
             if self.add_zenith:
-                inp, tar, izen, tzen = data
-            else:
-                inp, tar = data
+                izen = data[2]
+                tzen = data[3]
+                off += 2
+
+            if self.return_timestamp:
+                itime = data[0 + off]
+                ttime = data[1 + off]
 
             # upload to GPU
-            inp = inp.gpu()
-            tar = tar.gpu()
-            if self.add_zenith:
-                izen = izen.gpu()
-                tzen = tzen.gpu()
-
-            # roll if requested
-            if self.train and self.roll:
-                shift = fn.random.uniform(device="cpu", dtype=dali_types.INT32, range=[0, img_shape_y])
-
-                inp = fn.cat(inp[:, :, :, shift:], inp[:, :, :, :shift], device="gpu", axis=3)
-
-                tar = fn.cat(tar[:, :, :, shift:], tar[:, :, :, :shift], device="gpu", axis=3)
-
+            if self.dali_device == "gpu":
+                inp = inp.gpu()
+                tar = tar.gpu()
                 if self.add_zenith:
-                    izen = fn.cat(izen[:, :, :, shift:], izen[:, :, :, :shift], device="gpu", axis=3)
-
-                    tzen = fn.cat(tzen[:, :, :, shift:], tzen[:, :, :, :shift], device="gpu", axis=3)
+                    izen = izen.gpu()
+                    tzen = tzen.gpu()
 
             # normalize if requested
             if self.normalize:
-                inp = fn.normalize(inp, device="gpu", axis_names=self.norm_channels, batch=self.norm_batch, mean=self.in_bias, stddev=self.in_scale)
+                inp = fn.normalize(inp, device=self.dali_device, axis_names=self.norm_channels, batch=self.norm_batch, mean=self.in_bias, stddev=self.in_scale)
 
-                tar = fn.normalize(tar, device="gpu", axis_names=self.norm_channels, batch=self.norm_batch, mean=self.out_bias, stddev=self.out_scale)
-
-            # add noise if requested
-            if self.add_noise:
-                inp = fn.noise.gaussian(inp, device="gpu", stddev=self.noise_std, seed=self.local_seed)
+                tar = fn.normalize(tar, device=self.dali_device, axis_names=self.norm_channels, batch=self.norm_batch, mean=self.out_bias, stddev=self.out_scale)
 
             # add zenith angle if requested
+            pout = (inp, tar)
+
             if self.add_zenith:
-                pipeline.set_outputs(inp, tar, izen, tzen)
-            else:
-                pipeline.set_outputs(inp, tar)
+                pout = pout + (izen, tzen)
+
+            if self.return_timestamp:
+                pout = pout + (itime, ttime)
+
+            pipeline.set_outputs(*pout)
 
         return pipeline
 
-    def __init__(self, params, location, train, seed=333, final_eval=False):
+    def __init__(self, params, location, train, seed=333, dali_device="gpu"):
+        # set up workers and devices
         self.num_data_workers = params.num_data_workers
-        self.device_index = torch.cuda.current_device()
-        self.device = torch.device(f"cuda:{self.device_index}")
+        self.dali_device = dali_device
+        if self.dali_device == "gpu":
+            self.device_index = torch.cuda.current_device()
+            self.device = torch.device(f"cuda:{self.device_index}")
+        elif self.dali_device == "cpu":
+            self.device_index = None
+            self.device = torch.device("cpu")
+        else:
+            raise NotImplementedError(f"Makani currently does not support dali_device {self.dali_device}")
+
+        # batch size
         self.batchsize = int(params.batch_size)
 
         # set up seeds
@@ -129,24 +152,19 @@ class ERA5DaliESDataloader(object):
         self.n_future = params.n_future if train else params.valid_autoreg_steps
         self.in_channels = params.in_channels
         self.out_channels = params.out_channels
-        self.add_noise = params.add_noise if train else False
-        self.noise_std = params.noise_std
-        self.add_zenith = params.add_zenith if hasattr(params, "add_zenith") else False
+        self.add_zenith = params.get("add_zenith", False)
+        self.return_timestamp = params.get("return_timestamp", False)
         if hasattr(params, "lat") and hasattr(params, "lon"):
             self.lat_lon = (params.lat, params.lon)
         else:
             self.lat_lon = None
         self.dataset_path = params.h5_path
         if train:
-            self.n_samples = params.n_train_samples if hasattr(params, "n_train_samples") else None
-            self.n_samples_per_epoch = params.n_train_samples_per_epoch if hasattr(params, "n_train_samples_per_epoch") else None
+            self.n_samples = params.get("n_train_samples", None)
+            self.n_samples_per_epoch = params.get("n_train_samples_per_epoch", None)
         else:
-            self.n_samples = params.n_eval_samples if hasattr(params, "n_eval_samples") else None
-            self.n_samples_per_epoch = params.n_eval_samples_per_epoch if hasattr(params, "n_eval_samples_per_epoch") else None
-
-        if final_eval:
-            self.n_samples = None
-            self.n_samples_per_epoch = None
+            self.n_samples = params.get("n_eval_samples", None)
+            self.n_samples_per_epoch = params.get("n_eval_samples_per_epoch", None)
 
         # by default we normalize over space
         self.norm_channels = "FHW"
@@ -167,11 +185,18 @@ class ERA5DaliESDataloader(object):
         self.shard_id = params.data_shard_id
 
         # get cropping:
-        crop_size = [params.crop_size_x if hasattr(params, "crop_size_x") else None, params.crop_size_y if hasattr(params, "crop_size_y") else None]
-        crop_anchor = [params.crop_anchor_x if hasattr(params, "crop_anchor_x") else 0, params.crop_anchor_y if hasattr(params, "crop_anchor_y") else 0]
+        crop_size = [params.get("crop_size_x", None), params.get("crop_size_y", None)]
+        crop_anchor = [params.get("crop_anchor_x", 0), params.get("crop_anchor_y", 0)]
+
+        if os.path.isfile(self.location):
+            from makani.utils.dataloaders.dali_es_helper_concat_2d import GeneralConcatES as GeneralES
+        elif os.path.isdir(self.location):
+            from makani.utils.dataloaders.dali_es_helper_2d import GeneralES
+        else:
+            raise IOError(f"Path {self.location} does not exist.")
 
         # get the image sizes
-        self.extsource = esh.GeneralES(
+        self.extsource = GeneralES(
             self.location,
             max_samples=self.n_samples,
             samples_per_epoch=self.n_samples_per_epoch,
@@ -187,16 +212,18 @@ class ERA5DaliESDataloader(object):
             crop_anchor=crop_anchor,
             num_shards=self.num_shards,
             shard_id=self.shard_id,
-            io_grid=params.io_grid,
-            io_rank=params.io_rank,
+            io_grid=params.get("io_grid", [1, 1, 1]),
+            io_rank=params.get("io_rank", [0, 0, 0]),
             device_id=self.device_index,
             truncate_old=True,
             zenith_angle=self.add_zenith,
+            return_timestamp=self.return_timestamp,
             lat_lon=self.lat_lon,
             dataset_path=self.dataset_path,
             enable_odirect=params.enable_odirect,
+            enable_s3=params.enable_s3,
             enable_logging=params.log_to_screen,
-            seed=333,
+            seed=self.global_seed,
             is_parallel=True,
         )
 
@@ -204,8 +231,8 @@ class ERA5DaliESDataloader(object):
         self.grid_converter = GridConverter(
             params.data_grid_type,
             params.model_grid_type,
-            torch.deg2rad(torch.tensor(self.extsource.lat_lon[0])).to(torch.float32).to(self.device),
-            torch.deg2rad(torch.tensor(self.extsource.lat_lon[1])).to(torch.float32).to(self.device),
+            torch.deg2rad(torch.tensor(self.extsource.lat_lon_local[0])).to(torch.float32).to(self.device),
+            torch.deg2rad(torch.tensor(self.extsource.lat_lon_local[1])).to(torch.float32).to(self.device),
         )
 
         # some image properties
@@ -227,40 +254,24 @@ class ERA5DaliESDataloader(object):
 
         # load stats
         self.normalize = True
-        self.roll = params.roll
 
         # in
         if self.norm_mode == "offline":
-            if params.normalization == "minmax":
-                mins = np.load(params.min_path)[:, self.in_channels]
-                maxes = np.load(params.max_path)[:, self.in_channels]
-                self.in_bias = mins
-                self.in_scale = maxes - mins
-            elif params.normalization == "zscore":
-                means = np.load(params.global_means_path)[:, self.in_channels]
-                stds = np.load(params.global_stds_path)[:, self.in_channels]
-                self.in_bias = means
-                self.in_scale = stds
-            elif params.normalization == "none":
-                N_in_channels = len(self.in_channels)
-                self.in_bias = np.zeros((1, N_in_channels, 1, 1))
-                self.in_scale = np.ones((1, N_in_channels, 1, 1))
+            bias, scale = get_data_normalization(params)
 
-            # out
-            if params.normalization == "minmax":
-                mins = np.load(params.min_path)[:, self.out_channels]
-                maxes = np.load(params.max_path)[:, self.out_channels]
-                self.out_bias = mins
-                self.out_scale = maxes - mins
-            elif params.normalization == "zscore":
-                means = np.load(params.global_means_path)[:, self.out_channels]
-                stds = np.load(params.global_stds_path)[:, self.out_channels]
-                self.out_bias = means
-                self.out_scale = stds
-            elif params.normalization == "none":
-                N_out_channels = len(self.out_channels)
-                self.out_bias = np.zeros((1, N_out_channels, 1, 1))
-                self.out_scale = np.ones((1, N_out_channels, 1, 1))
+            if bias is not None:
+                self.in_bias = bias[:, self.in_channels]
+                self.out_bias = bias[:, self.out_channels]
+            else:
+                self.in_bias = np.zeros((1, len(self.in_channels), 1, 1))
+                self.out_bias = np.zeros((1, len(self.out_channels), 1, 1))
+
+            if scale is not None:
+                self.in_scale = scale[:, self.in_channels]
+                self.out_scale = scale[:, self.out_channels]
+            else:
+                self.in_scale = np.ones((1, len(self.in_channels), 1, 1))
+                self.out_scale = np.ones((1, len(self.out_channels), 1, 1))
 
             # reformat the biases
             if self.norm_channels == "FHW":
@@ -291,6 +302,9 @@ class ERA5DaliESDataloader(object):
         outnames = ["inp", "tar"]
         if self.add_zenith:
             outnames += ["izen", "tzen"]
+        if self.return_timestamp:
+            outnames += ["itime", "ttime"]
+
         self.iterator = DALIGenericIterator([self.pipeline], outnames, auto_reset=True, size=-1, last_batch_policy=LastBatchPolicy.DROP, prepare_first_batch=True)
 
     def get_input_normalization(self):
@@ -318,15 +332,21 @@ class ERA5DaliESDataloader(object):
             inp = token[0]["inp"]
             tar = token[0]["tar"]
 
+            # construct result
+            result = (inp, tar)
+
             if self.add_zenith:
                 izen = token[0]["izen"]
                 tzen = token[0]["tzen"]
-                result = inp, tar, izen, tzen
-            else:
-                result = inp, tar
+                result = result + (izen, tzen)
 
             # convert grid
             with torch.no_grad():
-                result = map(lambda x: self.grid_converter(x), result)
+                result = tuple(map(lambda x: self.grid_converter(x), result))
+
+            if self.return_timestamp:
+                itime = token[0]["itime"]
+                ttime = token[0]["ttime"]
+                result = result + (itime, ttime)
 
             yield result

@@ -7,13 +7,13 @@ This folder contains the configurations for training the ML models. This folder 
 makani
 ├── ...
 ├── config                  # configurations
-│   ├── afnonet.yaml        # baseline configurations for original FourCastNet paper
-│   ├── icml_models.yaml    # contains various dataloaders
+│   ├── afnonet.yaml        # baseline configurations from original FourCastNet paper
+│   ├── icml_models.yaml    # SFNO baselines from the ICML paper
 │   ├── sfnonet.yaml        # stable SFNO baselines
-│   ├── Readme.md           # this file
-│   └── vit.yaml            # ViT architecture
+│   ├── vit.yaml            # baseline configurations for a Vision Transformer
+│   └── Readme.md           # this file
 ...
 
 ```
 
-For the most recent configurations, check `sfnonet_devel.yaml`. The current baseline is `sfno_linear_73chq_sc3_layers8_edim384_wstgl2`.
+Baselines from the original FourCastNet paper can be found in `afnonet.yaml`. Configurations for Spherical FNOs from the ICML publication can be found in `icml_models.yaml`. The latest and greatest SFNO configurations are found in `sfnonet.yaml`.

@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import copy
 from functools import partial
+from typing import Union, Tuple
 
 import numpy as np
 
@@ -24,12 +26,14 @@ import torch.nn.functional as F
 
 from makani.utils import comm
 from makani.utils.grids import GridConverter
-from modulus.distributed.mappings import reduce_from_parallel_region, copy_to_parallel_region
+from physicsnemo.distributed.mappings import reduce_from_parallel_region, copy_to_parallel_region
+
+from makani.models.preprocessor_helpers import get_bias_correction, get_static_features
 
 
 class Preprocessor2D(nn.Module):
     def __init__(self, params):
-        super(Preprocessor2D, self).__init__()
+        super().__init__()
 
         self.n_history = params.n_history
         self.history_normalization_mode = params.history_normalization_mode
@@ -40,7 +44,7 @@ class Preprocessor2D(nn.Module):
             history_normalization_weights = history_normalization_weights / torch.sum(history_normalization_weights)
             history_normalization_weights = torch.reshape(history_normalization_weights, (1, -1, 1, 1, 1))
         elif self.history_normalization_mode == "mean":
-            history_normalization_weights = torch.Tensor(1.0 / float(self.n_history + 1), dtype=torch.float32)
+            history_normalization_weights = torch.as_tensor(1.0 / float(self.n_history + 1), dtype=torch.float32)
             history_normalization_weights = torch.reshape(history_normalization_weights, (1, -1, 1, 1, 1))
         else:
             history_normalization_weights = torch.ones(self.n_history + 1, dtype=torch.float32)
@@ -55,7 +59,7 @@ class Preprocessor2D(nn.Module):
         self.learn_residual = params.target == "residual"
         if self.learn_residual and (params.normalize_residual):
             with torch.no_grad():
-                residual_scale = torch.from_numpy(np.load(params.time_diff_stds_path)).to(torch.float32)
+                residual_scale = torch.as_tensor(np.load(params.time_diff_stds_path)).to(torch.float32)
                 self.register_buffer("residual_scale", residual_scale, persistent=False)
         else:
             self.residual_scale = None
@@ -69,94 +73,99 @@ class Preprocessor2D(nn.Module):
         self.unpredicted_inp_eval = None
         self.unpredicted_tar_eval = None
 
+        # get bias correction
+        bias = get_bias_correction(params)
+
+        if bias is not None:
+            # register static buffer
+            self.register_buffer("bias_correction", bias, persistent=False)
+
         # process static features
-        static_features = None
-        # needed for sharding
-        start_x = params.img_local_offset_x
-        end_x = min(start_x + params.img_local_shape_x, params.img_shape_x)
-        start_y = params.img_local_offset_y
-        end_y = min(start_y + params.img_local_shape_y, params.img_shape_y)
-
-        # set up grid
-        if params.add_grid:
-            with torch.no_grad():
-                if hasattr(params, "lat") and hasattr(params, "lon"):
-                    lat = torch.tensor(params.lat).to(torch.float32)
-                    lon = torch.tensor(params.lon).to(torch.float32)
-
-                    # convert grid if required
-                    gconv = GridConverter(params.data_grid_type, params.model_grid_type, torch.deg2rad(lat), torch.deg2rad(lon))
-                    tx, ty = gconv.get_dst_coords()
-                    tx = tx.to(torch.float32)
-                    ty = ty.to(torch.float32)
-                else:
-                    tx = torch.linspace(0, 1, params.img_shape_x + 1, dtype=torch.float32)[0:-1]
-                    ty = torch.linspace(0, 1, params.img_shape_y + 1, dtype=torch.float32)[0:-1]
-
-                x_grid, y_grid = torch.meshgrid(tx, ty, indexing="ij")
-                x_grid, y_grid = x_grid.unsqueeze(0).unsqueeze(0), y_grid.unsqueeze(0).unsqueeze(0)
-                grid = torch.cat([x_grid, y_grid], dim=1)
-
-                # shard spatially:
-                grid = grid[:, :, start_x:end_x, start_y:end_y]
-
-                # transform if requested
-                if params.gridtype == "sinusoidal":
-                    num_freq = 1
-                    if hasattr(params, "grid_num_frequencies"):
-                        num_freq = int(params.grid_num_frequencies)
-
-                    singrid = None
-                    for freq in range(1, num_freq + 1):
-                        if singrid is None:
-                            singrid = torch.sin(grid)
-                        else:
-                            singrid = torch.cat([singrid, torch.sin(freq * grid)], dim=1)
-
-                    static_features = singrid
-                else:
-                    static_features = grid
-
-        if params.add_orography:
-            from makani.utils.conditioning_inputs import get_orography
-
-            with torch.no_grad():
-                oro = torch.tensor(get_orography(params.orography_path), dtype=torch.float32)
-                oro = torch.reshape(oro, (1, 1, oro.shape[0], oro.shape[1]))
-
-                # normalize
-                eps = 1.0e-6
-                oro = (oro - torch.mean(oro)) / (torch.std(oro) + eps)
-
-                # shard
-                oro = oro[:, :, start_x:end_x, start_y:end_y]
-
-                if static_features is None:
-                    static_features = oro
-                else:
-                    static_features = torch.cat([static_features, oro], dim=1)
-
-        if params.add_landmask:
-            from makani.utils.conditioning_inputs import get_land_mask
-
-            with torch.no_grad():
-                lsm = torch.tensor(get_land_mask(params.landmask_path), dtype=torch.long)
-                # one hot encode and move channels to front:
-                lsm = torch.permute(torch.nn.functional.one_hot(lsm), (2, 0, 1)).to(torch.float32)
-                lsm = torch.reshape(lsm, (1, lsm.shape[0], lsm.shape[1], lsm.shape[2]))
-
-                # shard
-                lsm = lsm[:, :, start_x:end_x, start_y:end_y]
-
-                if static_features is None:
-                    static_features = lsm
-                else:
-                    static_features = torch.cat([static_features, lsm], dim=1)
-
+        static_features = get_static_features(params)
         self.do_add_static_features = False
         if static_features is not None:
+
+            # remember that we need static features
             self.do_add_static_features = True
+
+            # register static buffer
             self.register_buffer("static_features", static_features, persistent=False)
+
+        if hasattr(params, "input_noise"):
+            noise_params = params.input_noise
+            centered_noise = noise_params.get("centered", False)
+
+            # noise seed: important, this will be passed down as-is
+            if not centered_noise:
+                seed = 333 + comm.get_rank("model") + comm.get_size("model") * comm.get_rank("data")
+                reflect = False
+            else:
+                # here, ranks (0,1), (2,3), ... should map to the same eff rank, since they only differ by reflection but should otherwise get the
+                # same seed
+                ensemble_eff_rank = comm.get_rank("ensemble") // 2
+                reflect = (comm.get_rank("ensemble") % 2 == 0)
+                seed = 333 + comm.get_rank("model") + comm.get_size("model") * ensemble_eff_rank + comm.get_size("model") * comm.get_size("ensemble") * comm.get_rank("batch")
+
+            if "type" not in noise_params:
+                raise ValueError("Error, please specify an input noise type")
+
+            self.input_noise_mode = noise_params.get("mode", "concatenate")
+
+            if self.input_noise_mode == "concatenate":
+                noise_channels = noise_params.get("n_channels", 1)
+            elif self.input_noise_mode == "perturb":
+                self.perturb_channels = noise_params.get("perturb_channels", params.channel_names)
+                self.perturb_channels = [params.channel_names.index(ch) for ch in self.perturb_channels]
+                noise_channels = len(self.perturb_channels)
+            else:
+                raise NotImplementedError(f"Error, input noise mode {self.input_noise_mode} not supported.")
+
+            if noise_params["type"] == "diffusion":
+                from makani.models.noise import DiffusionNoiseS2
+
+                # set the spatio-temporal correlation length
+                kT = noise_params.get("kT", 0.5 * (100 / 6370) ** 2)
+                lambd = noise_params.get("lambd", params.dt * params.dhours / 6.0)
+
+                self.input_noise = DiffusionNoiseS2(
+                    img_shape=self.img_shape,
+                    batch_size=params.batch_size,
+                    num_channels=noise_channels,
+                    num_time_steps=self.n_history + 1,
+                    sigma=noise_params.get("sigma", 1.0),
+                    kT=kT,  # use various scales
+                    lambd=lambd,  # use suggestion here: tau=6h
+                    grid_type=params.model_grid_type,
+                    seed=seed,
+                    reflect=reflect,
+                    learnable=noise_params.get("learnable", False)
+                )
+            elif noise_params["type"] == "white":
+                from makani.models.noise import IsotropicGaussianRandomFieldS2
+
+                self.input_noise = IsotropicGaussianRandomFieldS2(
+                    img_shape=self.img_shape,
+                    batch_size=params.batch_size,
+                    num_channels=noise_channels,
+                    num_time_steps=self.n_history + 1,
+                    sigma=noise_params.get("sigma", 1.0),
+                    alpha=noise_params.get("alpha", 0.0),
+                    grid_type=params.model_grid_type,
+                    seed=seed,
+                    reflect=reflect,
+                    learnable=noise_params.get("learnable", False)
+                )
+            elif noise_params["type"] == "dummy":
+                from makani.models.noise import DummyNoiseS2
+
+                self.input_noise = DummyNoiseS2(
+                    img_shape=self.img_shape,
+                    batch_size=params.batch_size,
+                    num_channels=noise_channels,
+                    num_time_steps=self.n_history + 1,
+                )
+            else:
+                raise NotImplementedError(f'Error, input noise type {noise_params["type"]} not supported.')
 
     def flatten_history(self, x):
         # flatten input
@@ -201,28 +210,29 @@ class Preprocessor2D(nn.Module):
             x = x[:, : x.shape[1] - nfeat, :, :]
         return x
 
-    def append_history(self, x1, x2, step):
-        # take care of unpredicted features first
-        # this is necessary in order to copy the targets unpredicted features
-        # (such as zenith angle) into the inputs unpredicted features,
-        # such that they can be forward in the next autoregressive step
-        # extract utar
+    def append_history(self, x1, x2, step, update_state=True):
+        r"""
+        Take care of unpredicted features first. This is necessary in order to copy the targets unpredicted features
+        (such as zenith angle) into the inputs unpredicted features, such that they can be forward in the next
+        autoregressive step. extract utar
+        """
 
         # update the unpredicted input
-        if self.training:
-            if (self.unpredicted_tar_train is not None) and (step < self.unpredicted_tar_train.shape[1]):
-                utar = self.unpredicted_tar_train[:, step : (step + 1), :, :, :]
-                if self.n_history == 0:
-                    self.unpredicted_inp_train.copy_(utar)
-                else:
-                    self.unpredicted_inp_train.copy_(torch.cat([self.unpredicted_inp_train[:, 1:, :, :, :], utar], dim=1))
-        else:
-            if (self.unpredicted_tar_eval is not None) and (step < self.unpredicted_tar_eval.shape[1]):
-                utar = self.unpredicted_tar_eval[:, step : (step + 1), :, :, :]
-                if self.n_history == 0:
-                    self.unpredicted_inp_eval.copy_(utar)
-                else:
-                    self.unpredicted_inp_eval.copy_(torch.cat([self.unpredicted_inp_eval[:, 1:, :, :, :], utar], dim=1))
+        if update_state:
+            if self.training:
+                if (self.unpredicted_tar_train is not None) and (step < self.unpredicted_tar_train.shape[1]):
+                    utar = self.unpredicted_tar_train[:, step : (step + 1), :, :, :]
+                    if self.n_history == 0:
+                        self.unpredicted_inp_train.copy_(utar)
+                    else:
+                        self.unpredicted_inp_train.copy_(torch.cat([self.unpredicted_inp_train[:, 1:, :, :, :], utar], dim=1))
+            else:
+                if (self.unpredicted_tar_eval is not None) and (step < self.unpredicted_tar_eval.shape[1]):
+                    utar = self.unpredicted_tar_eval[:, step : (step + 1), :, :, :]
+                    if self.n_history == 0:
+                        self.unpredicted_inp_eval.copy_(utar)
+                    else:
+                        self.unpredicted_inp_eval.copy_(torch.cat([self.unpredicted_inp_eval[:, 1:, :, :, :], utar], dim=1))
 
         if self.n_history > 0:
             # this is more complicated
@@ -239,11 +249,22 @@ class Preprocessor2D(nn.Module):
 
         return res
 
-    def append_channels(self, x, xc):
-        xdim = x.dim()
-        x = self.expand_history(x, self.n_history + 1)
+    def _append_channels(self, x, xc):
 
+        # x-dimension
+        xdim = x.dim()
+
+        # expand history
+        x = self.expand_history(x, self.n_history + 1)
         xc = self.expand_history(xc, self.n_history + 1)
+
+        # this routine also adds noise every time a channel gets appended
+        if hasattr(self, "input_noise"):
+            n = self.input_noise()
+            if self.input_noise_mode == "concatenate":
+                xc = torch.cat([xc, n], dim=2)
+            elif self.input_noise_mode == "perturb":
+                x[:, :, self.perturb_channels] = x[:, :, self.perturb_channels] + n
 
         # concatenate
         xo = torch.cat([x, xc], dim=2)
@@ -376,51 +397,115 @@ class Preprocessor2D(nn.Module):
 
     def cache_unpredicted_features(self, x, y, xz=None, yz=None):
         if self.training:
-            if (self.unpredicted_inp_train is not None) and (xz is not None):
+            if (self.unpredicted_inp_train is not None) and (xz is not None) and (self.unpredicted_inp_train.shape == xz.shape):
                 self.unpredicted_inp_train.copy_(xz)
             else:
                 self.unpredicted_inp_train = xz
 
-            if (self.unpredicted_tar_train is not None) and (yz is not None):
+            if (self.unpredicted_tar_train is not None) and (yz is not None) and (self.unpredicted_tar_train.shape == yz.shape):
                 self.unpredicted_tar_train.copy_(yz)
             else:
                 self.unpredicted_tar_train = yz
         else:
-            if (self.unpredicted_inp_eval is not None) and (xz is not None):
+            if (self.unpredicted_inp_eval is not None) and (xz is not None) and (self.unpredicted_inp_eval.shape == xz.shape):
                 self.unpredicted_inp_eval.copy_(xz)
             else:
                 self.unpredicted_inp_eval = xz
 
-            if (self.unpredicted_tar_eval is not None) and (yz is not None):
+            if (self.unpredicted_tar_eval is not None) and (yz is not None) and (self.unpredicted_tar_eval.shape == yz.shape):
                 self.unpredicted_tar_eval.copy_(yz)
             else:
                 self.unpredicted_tar_eval = yz
 
         return x, y
 
-    def append_unpredicted_features(self, inp):
-        if self.training:
-            if self.unpredicted_inp_train is not None:
-                inp = self.append_channels(inp, self.unpredicted_inp_train)
+    def get_internal_rng(self, gpu=True):
+        if hasattr(self, "input_noise"):
+            if gpu:
+                return self.input_noise.rng_gpu
+            else:
+                return self.input_noise.rng_cpu
         else:
-            if self.unpredicted_inp_eval is not None:
-                inp = self.append_channels(inp, self.unpredicted_inp_eval)
+            return None
+
+    def get_internal_state(self, tensor=False):
+        if hasattr(self, "input_noise"):
+            if tensor:
+                state = self.input_noise.get_tensor_state()
+            else:
+                state = self.input_noise.get_rng_state()
+        else:
+            if tensor:
+                state = None
+            else:
+                state = (None, None)
+
+        return state
+
+    def set_internal_state(self, state: Union[Tuple, torch.Tensor]):
+        if hasattr(self, "input_noise") and (state is not None):
+            if isinstance(state, torch.Tensor):
+                self.input_noise.set_tensor_state(state)
+            else:
+                self.input_noise.set_rng_state(*state)
+
+        return
+
+    def update_internal_state(self, replace_state=False, batch_size=None):
+        if hasattr(self, "input_noise"):
+            self.input_noise.update(replace_state=replace_state, batch_size=batch_size)
+        return
+
+    def append_unpredicted_features(self, inp, target=False):
+        if self.training:
+            if not target:
+                if self.unpredicted_inp_train is not None:
+                    inp = self._append_channels(inp, self.unpredicted_inp_train)
+            else:
+                if self.unpredicted_tar_train is not None:
+                    inp = self._append_channels(inp, self.unpredicted_tar_train)
+        else:
+            if not target:
+                if self.unpredicted_inp_eval is not None:
+                    inp = self._append_channels(inp, self.unpredicted_inp_eval)
+            else:
+                if self.unpredicted_tar_eval is not None:
+                    inp = self._append_channels(inp, self.unpredicted_tar_eval)
         return inp
 
-    def remove_unpredicted_features(self, inp):
+    # accessors: clone returned tensors just to be safe
+    def get_static_features(self):
+        if self.do_add_static_features:
+            return self.static_features.clone()
+        else:
+            return None
+
+    def get_unpredicted_features(self):
         if self.training:
             if self.unpredicted_inp_train is not None:
-                inpf = self.expand_history(inp, nhist=self.n_history + 1)
-                inpc = inpf[:, :, : inpf.shape[2] - self.unpredicted_inp_train.shape[2], :, :]
-                inp = self.flatten_history(inpc)
+                inpu = self.unpredicted_inp_train.clone()
+            else:
+                inpu = None
+            if self.unpredicted_tar_train is not None:
+                taru = self.unpredicted_tar_train.clone()
+            else:
+                taru = None
         else:
             if self.unpredicted_inp_eval is not None:
-                inpf = self.expand_history(inp, nhist=self.n_history + 1)
-                inpc = inpf[:, :, : inpf.shape[2] - self.unpredicted_inp_eval.shape[2], :, :]
-                inp = self.flatten_history(inpc)
+                inpu = self.unpredicted_inp_eval.clone()
+            else:
+                inpu = None
+            if self.unpredicted_tar_eval is not None:
+                taru = self.unpredicted_tar_eval.clone()
+            else:
+                taru = None
 
+        return inpu, taru
+
+    def correct_bias(self, inp: torch.Tensor):
+        if hasattr(self, "bias_correction"):
+            inp = inp - self.bias_correction
         return inp
-
 
 def get_preprocessor(params):
     return Preprocessor2D(params)

@@ -3,7 +3,7 @@ full_field: &BASE_CONFIG
     # metadata file for the dataset
     metadata_json_path: "/metadata/data.json"
 
-    # data 
+    # data
     train_data_path: "/train"
     valid_data_path: "/test"
     exp_dir: "/runs"
@@ -33,9 +33,7 @@ full_field: &BASE_CONFIG
     dt: 1 # how many timesteps ahead the model will predict
     n_history: 0 #how many previous timesteps to consider
     prediction_type: "iterative"
-    prediction_length: 35 #applicable only if prediction_type == "iterative"
-    n_initial_conditions: 5 #applicable only if prediction_type == "iterative"
-    valid_autoreg_steps: 20 # number of autoregressive steps for validation
+    valid_autoreg_steps: 19 # number of autoregressive steps for validation
 
     ics_type: "specify_number"
     save_raw_forecasts: !!bool True
@@ -49,7 +47,7 @@ full_field: &BASE_CONFIG
 
     max_epochs: 150
     batch_size: 32
-    nettype: "AFNOv1"
+    nettype: "AFNO"
     model_grid_type: "equiangular"
     patch_size: [8,8]
     num_blocks: 8
@@ -60,17 +58,16 @@ full_field: &BASE_CONFIG
     verbose: False
 
     #options default, residual
-    target: "default" 
+    target: "default"
 
     channel_names: ["u10m", "v10m", "t2m", "sp", "msl", "t850", "u1000", "v1000", "z1000", "u850", "v850", "z850", "u500", "v500", "z500", "t500", "z50", "r500", "r850", "tcwv", "u100m", "v100m", "u250", "v250", "z250", "t250", "u100", "v100", "z100", "t100", "u900", "v900", "z900", "t900"]
     normalization: "zscore" #options zscore or minmax
     hard_thresholding_fraction: 1.0
-  
+
     # extra channels
     add_grid: !!bool False
     gridtype: "sinusoidal"
     grid_num_frequencies: 16
-    roll: !!bool False
     add_zenith: !!bool True
     # invariants
     add_orography: !!bool True
@@ -78,7 +75,7 @@ full_field: &BASE_CONFIG
     add_landmask: !!bool True
     landmask_path: /invariants/land_sea_mask.nc
 
-    finetune: !!bool False
+    pretrained: !!bool False
 
     log_to_screen: !!bool True
     log_to_wandb: !!bool True
@@ -88,7 +85,7 @@ full_field: &BASE_CONFIG
     optimizer_type: "Adam"
     optimizer_beta1: 0.9
     optimizer_beta2: 0.999
-    optimizer_max_grad_norm: 1.0 
+    optimizer_max_grad_norm: 1.0
     # this is necessary to have the height be a multiple of the patching size
     crop_size_x: 720
     crop_size_y: 1440
@@ -98,50 +95,54 @@ full_field: &BASE_CONFIG
     two_step_training: !!bool False
 
     # Weights and biases configuration
-    wandb_name: None # If None, config will be used but you can override it here
-    wandb_group: None # If None, will be "era5_wind" + config, but you can override it here
-    wandb_project: "distributed sfno training"
-    wandb_entity: "sfno-large-model-training" # but your username here
+    wandb_name: None
+    wandb_group: "afnonet"
+    wandb_project: "afnonet_development"
+    wandb_entity: "your_wandb_entity"
 
     inf_data_path: "/out_of_sample"
 
-afno_26ch_arxiv_network: &AFNO_26CH
+###########################################################################################################################
+# FourCastNet1 configurations
+###########################################################################################################################
+
+fourcastnet1_26ch_arxiv_network: &AFNO_26CH
     <<: *BASE_CONFIG
-    nettype: "AFNOv1"
+    nettype: "AFNO"
     lr: 5E-4
     batch_size: 64
     max_epochs: 150
 
-afno_26ch_arxiv_network_finetune:
+fourcastnet1_26ch_arxiv_network_finetune:
     <<: *AFNO_26CH
-    nettype: "AFNOv1"
+    nettype: "AFNO"
     lr: 1E-4
     batch_size: 64
     max_epochs: 50
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/pretrained_checkpoint_path/" # path to pretrained checkpoint
 
-afno_26ch_arxiv_network_test_config:
+fourcastnet1_26ch_arxiv_network_test_config:
     <<: *AFNO_26CH
     lr: 1E-4
     n_train_samples: 32
-    n_eval_samples: 32 
+    n_eval_samples: 32
     batch_size: 64
     max_epochs: 1
     scheduler_T_max: 2
 
-afno_26ch_optimized_network: 
+fourcastnet1_26ch_optimized_network:
     <<: *AFNO_26CH
     nettype: "AFNO"
     lr: 5E-4
     batch_size: 64
     max_epochs: 150
 
-afno_26ch_optimized_network_finetune:
+fourcastnet1_26ch_optimized_network_finetune:
     <<: *AFNO_26CH
-    nettype: "AFNO"
+    nettype: "AFNOv2"
     lr: 1E-4
     batch_size: 64
     max_epochs: 50
-    finetune: !!bool True
+    pretrained: !!bool True
     pretrained_checkpoint_path: "/pretrained_checkpoint_path/" # path to pretrained checkpoint

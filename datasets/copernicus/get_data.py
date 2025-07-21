@@ -74,8 +74,9 @@ def main(args):
                                'grid': [args.resolution, args.resolution],
                                'format': 'netcdf',
                                'levelist': f'{pl}',
-                               # u, v, w, z, t, q
-                               "param": "131/132/135.128/129.128/130.128/133.128",
+                               # w = 135.128
+                               # u, v, z, t, q 
+                               "param": "131/132/129.128/130.128/133.128",
                                'date': f'{year_str}-{month_str}-01/to/{year_str}-{month_str}-31',
                                'time': timestamps,
                            },
