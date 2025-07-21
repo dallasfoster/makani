@@ -27,32 +27,30 @@ from makani.utils.YParams import ParamsBase
 from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle import cos_zenith_angle
 from makani.utils.dataloaders.data_helpers import get_data_normalization
-
 from makani.models import model_registry
-
 import datetime
-
 import logging
 
 
 logger = logging.getLogger(__name__)
 
-# These define the model package in terms of where makani expects the files to be located
-THIS_MODULE = "makani.models.model_package"
-MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
-MINS_FILE = "mins.npy"
-MAXS_FILE = "maxs.npy"
-MEANS_FILE = "global_means.npy"
-STDS_FILE = "global_stds.npy"
-OROGRAPHY_FILE = "orography.nc"
-LANDMASK_FILE = "land_mask.nc"
-SOILTYPE_FILE = "soil_type.nc"
 
 
 class LocalPackage:
     """
     Implements the earth2mip/modulus Package interface.
     """
+
+    # These define the model package in terms of where makani expects the files to be located
+    THIS_MODULE = "makani.models.model_package"
+    MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
+    MINS_FILE = "mins.npy"
+    MAXS_FILE = "maxs.npy"
+    MEANS_FILE = "global_means.npy"
+    STDS_FILE = "global_stds.npy"
+    OROGRAPHY_FILE = "orography.nc"
+    LANDMASK_FILE = "land_mask.nc"
+    SOILTYPE_FILE = "soil_type.nc"
 
     def __init__(self, root):
         self.root = root
