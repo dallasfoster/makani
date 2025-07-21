@@ -27,32 +27,30 @@ from makani.utils.YParams import ParamsBase
 from makani.utils.driver import Driver
 from makani.third_party.climt.zenith_angle import cos_zenith_angle
 from makani.utils.dataloaders.data_helpers import get_data_normalization
-
 from makani.models import model_registry
-
 import datetime
-
 import logging
 
 
 logger = logging.getLogger(__name__)
 
-# These define the model package in terms of where makani expects the files to be located
-THIS_MODULE = "makani.models.model_package"
-MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
-MINS_FILE = "mins.npy"
-MAXS_FILE = "maxs.npy"
-MEANS_FILE = "global_means.npy"
-STDS_FILE = "global_stds.npy"
-OROGRAPHY_FILE = "orography.nc"
-LANDMASK_FILE = "land_mask.nc"
-SOILTYPE_FILE = "soil_type.nc"
 
 
 class LocalPackage:
     """
     Implements the earth2mip/modulus Package interface.
     """
+
+    # These define the model package in terms of where makani expects the files to be located
+    THIS_MODULE = "makani.models.model_package"
+    MODEL_PACKAGE_CHECKPOINT_PATH = "training_checkpoints/best_ckpt_mp0.tar"
+    MINS_FILE = "mins.npy"
+    MAXS_FILE = "maxs.npy"
+    MEANS_FILE = "global_means.npy"
+    STDS_FILE = "global_stds.npy"
+    OROGRAPHY_FILE = "orography.nc"
+    LANDMASK_FILE = "land_mask.nc"
+    SOILTYPE_FILE = "soil_type.nc"
 
     def __init__(self, root):
         self.root = root
@@ -63,21 +61,21 @@ class LocalPackage:
     @staticmethod
     def _load_static_data(root, params):
         if params.get("add_orography", False):
-            params.orography_path = os.path.join(root, OROGRAPHY_FILE)
+            params.orography_path = os.path.join(root, self.OROGRAPHY_FILE)
         if params.get("add_landmask", False):
-            params.landmask_path = os.path.join(root, LANDMASK_FILE)
+            params.landmask_path = os.path.join(root, self.LANDMASK_FILE)
         if params.get("add_soiltype", False):
-            params.soiltype_path = os.path.join(root, SOILTYPE_FILE)
+            params.soiltype_path = os.path.join(root, self.SOILTYPE_FILE)
 
         # alweays load all normalization files
         if params.get("global_means_path", None) is not None:
-            params.global_means_path = os.path.join(root, MEANS_FILE)
+            params.global_means_path = os.path.join(root, self.MEANS_FILE)
         if params.get("global_stds_path", None) is not None:
-            params.global_stds_path = os.path.join(root, STDS_FILE)
+            params.global_stds_path = os.path.join(root, self.STDS_FILE)
         if params.get("min_path", None) is not None:
-            params.min_path = os.path.join(root, MINS_FILE)
+            params.min_path = os.path.join(root, self.MINS_FILE)
         if params.get("max_path", None) is not None:
-            params.max_path = os.path.join(root, MAXS_FILE)
+            params.max_path = os.path.join(root, self.MAXS_FILE)
 
 
 class ModelWrapper(torch.nn.Module):
@@ -182,27 +180,27 @@ def save_model_package(params):
         f.write(msg)
 
     if params.get("add_orography", False):
-        shutil.copy(params.orography_path, os.path.join(params.experiment_dir, "orography.nc"))
+        shutil.copy(params.orography_path, os.path.join(params.experiment_dir, os.path.basename(params.orography_path)))
 
     if params.get("add_landmask", False):
-        shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, "land_mask.nc"))
+        shutil.copy(params.landmask_path, os.path.join(params.experiment_dir, os.path.basename(params.landmask_path)))
 
     if params.get("add_soiltype", False):
-        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, "soil_type.nc"))
+        shutil.copy(params.soiltype_path, os.path.join(params.experiment_dir, os.path.basename(params.soiltype_path)))
 
     # always save out all normalization files
     if params.get("global_means_path", None) is not None:
-        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, MEANS_FILE))
+        shutil.copy(params.global_means_path, os.path.join(params.experiment_dir, os.path.basename(params.global_means_path)))
     if params.get("global_stds_path", None) is not None:
-        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, STDS_FILE))
+        shutil.copy(params.global_stds_path, os.path.join(params.experiment_dir, os.path.basename(params.global_stds_path)))
     if params.get("min_path", None) is not None:
-        shutil.copy(params.min_path, os.path.join(params.experiment_dir, MINS_FILE))
+        shutil.copy(params.min_path, os.path.join(params.experiment_dir, os.path.basename(params.min_path)))
     if params.get("max_path", None) is not None:
-        shutil.copy(params.max_path, os.path.join(params.experiment_dir, MAXS_FILE))
+        shutil.copy(params.max_path, os.path.join(params.experiment_dir, os.path.basename(params.max_path)))
 
     # write out earth2mip metadata.json
     fcn_mip_data = {
-        "entrypoint": {"name": f"{THIS_MODULE}:load_time_loop"},
+        "entrypoint": {"name": f"{LocalPackage.THIS_MODULE}:load_time_loop"},
     }
     with open(os.path.join(params.experiment_dir, "metadata.json"), "w") as f:
         msg = jsbeautifier.beautify(json.dumps(fcn_mip_data), jsopts)
@@ -229,7 +227,7 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     model = model_registry.get_model(params, multistep=multistep).to(device)
 
     if pretrained:
-        best_checkpoint_path = package.get(MODEL_PACKAGE_CHECKPOINT_PATH)
+        best_checkpoint_path = package.get(LocalPackage.MODEL_PACKAGE_CHECKPOINT_PATH)
         Driver.restore_from_checkpoint(best_checkpoint_path, model)
 
     model = ModelWrapper(model, params=params)
@@ -262,10 +260,10 @@ def load_time_loop(package, device=None, time_step_hours=None):
         raise NotImplementedError("Non-equal input and output channels are not implemented yet.")
 
     names = [params.data_channel_names[i] for i in params.in_channels]
-    params.min_path = package.get(MINS_FILE)
-    params.max_path = package.get(MAXS_FILE)
-    params.global_means_path = package.get(MEANS_FILE)
-    params.global_stds_path = package.get(STDS_FILE)
+    params.min_path = package.get(LocalPackage.MINS_FILE)
+    params.max_path = package.get(LocalPackage.MAXS_FILE)
+    params.global_means_path = package.get(LocalPackage.MEANS_FILE)
+    params.global_stds_path = package.get(LocalPackage.STDS_FILE)
 
     center, scale = get_data_normalization(params)
 
