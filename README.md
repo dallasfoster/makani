@@ -9,7 +9,7 @@ Makani (the Hawaiian word for wind 🍃🌺) is a library designed to enable the
 Makani is aimed at researchers working on ML based weather prediction. Stable features are frequently ported to the [earth2studio](https://github.com/NVIDIA/earth2studio) and the [NVIDIA PhysicsNeMo](https://developer.nvidia.com/physicsnemo) framework. For commercial and production purposes, we recommend checking out these packages.
 
 <div align="center">
-<img src="https://github.com/NVIDIA/makani/raw/main/images/fcn3_ens3_640p.gif"  height="388px">
+<img src="https://raw.githubusercontent.com/NVIDIA/makani/main/images/fcn3_ens15_640p.gif"  height="320px">
 </div>
 
 ## Overview
