@@ -59,23 +59,23 @@ class LocalPackage:
         return os.path.join(self.root, path)
 
     @staticmethod
-    def _load_static_data(root, params):
+    def _load_static_data(package, params):
         if params.get("add_orography", False):
-            params.orography_path = os.path.join(root, self.OROGRAPHY_FILE)
+            params.orography_path = package.get(LocalPackage.OROGRAPHY_FILE)
         if params.get("add_landmask", False):
-            params.landmask_path = os.path.join(root, self.LANDMASK_FILE)
+            params.landmask_path = package.get(LocalPackage.LANDMASK_FILE)
         if params.get("add_soiltype", False):
-            params.soiltype_path = os.path.join(root, self.SOILTYPE_FILE)
+            params.soiltype_path = package.get(LocalPackage.SOILTYPE_FILE)
 
         # alweays load all normalization files
         if params.get("global_means_path", None) is not None:
-            params.global_means_path = os.path.join(root, self.MEANS_FILE)
+            params.global_means_path = package.get(LocalPackage.MEANS_FILE)
         if params.get("global_stds_path", None) is not None:
-            params.global_stds_path = os.path.join(root, self.STDS_FILE)
+            params.global_stds_path = package.get(LocalPackage.STDS_FILE)
         if params.get("min_path", None) is not None:
-            params.min_path = os.path.join(root, self.MINS_FILE)
+            params.min_path = package.get(LocalPackage.MINS_FILE)
         if params.get("max_path", None) is not None:
-            params.max_path = os.path.join(root, self.MAXS_FILE)
+            params.max_path = package.get(LocalPackage.MAXS_FILE)
 
 
 class ModelWrapper(torch.nn.Module):
@@ -214,7 +214,7 @@ def load_model_package(package, pretrained=True, device="cpu", multistep=False):
     """
     path = package.get("config.json")
     params = ParamsBase.from_json(path)
-    LocalPackage._load_static_data(package.root, params)
+    LocalPackage._load_static_data(package, params)
 
     # assume we are not distributed
     # distributed checkpoints might be saved with different params values
