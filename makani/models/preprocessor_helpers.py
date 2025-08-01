@@ -97,12 +97,19 @@ def get_static_features(params):
             if gridtype == "sinusoidal":
                 num_freq = params.get("grid_num_frequencies", 1)
 
+                add_cos = params.get("add_cos_to_grid", True)
                 singrid = None
                 for freq in range(1, num_freq + 1):
                     if singrid is None:
-                        singrid = [torch.sin(grid), torch.cos(grid)]
+                        if add_cos:
+                            singrid =[torch.sin(grid), torch.cos(grid)]
+                        else:
+                            singrid = [torch.sin(grid)]
                     else:
-                        singrid = singrid + [torch.sin(freq * grid), torch.cos(freq * grid)]
+                        if add_cos:
+                            singrid = singrid + [torch.sin(freq * grid), torch.cos(freq * grid)]
+                        else:
+                            singrid = singrid + [torch.sin(freq * grid)]
 
                 static_features = torch.cat(singrid, dim=-3)
             else:
